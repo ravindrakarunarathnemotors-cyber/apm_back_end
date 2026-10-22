@@ -1,0 +1,51 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
+    "@socket.io/admin-ui": "^0.5.1",
+    "@turf/boolean-point-in-polygon": "^7.2.0",
+    "@turf/helpers": "^7.2.0",
+    "aws-sdk": "^2.1693.0",
+    "axios": "^1.12.2",
+    "bcrypt": "^5.1.1",
+    "connect-timeout": "^1.9.1",
+    "cookie-parser": "^1.4.7",
+    "cookie-session": "^2.1.1",
+    "cors": "^2.8.5",
+    "crypto-js": "^4.2.0",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-validator": "^7.2.1",
+    "helmet": "^8.0.0",
+    "joi": "^17.13.3",
+    "jsonwebtoken": "^9.0.3",
+    "moment-timezone": "^0.5.48",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3",
+    "openai": "^5.10.1",
+    "pg": "^8.13.1",
+    "pg-promise": "^12.6.2",
+    "simple-git": "^3.36.0",
+    "socket.io": "^4.8.3",
+    "ssh2": "^1.17.0",
+    "ua-parser-js": "^2.0.9"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-mock": "^29.7.0",
+    "nodemon": "^3.1.9",
+    "pg-mock": "^1.0.1"
+  }
+}
