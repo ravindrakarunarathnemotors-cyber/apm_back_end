@@ -20,37 +20,31 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 
-/// routes/complaint.routes.js
-// Stage 5: "Customer Complaint recording / Review" for every department.
-// Mount in your app:  app.use("/api", require("./routes/complaint.routes"));
-// Run create_complaint_tables.sql first.
-
-
 const COMPLAINT_STAGE_NO = 5;
-
+ 
 // SECURITY: only these admin_user.role_id values may add / edit / remove the type lists.
 // (role_id 1 = admin in your admin_user table. Add more role ids if needed.)
 const MANAGE_LIST_ROLE_IDS = [1];
-
+ 
 /* ----------------------------- helpers ----------------------------- */
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
   return Number.isInteger(n) ? n : null;
 };
-
+ 
 const clean = (v) => {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
   return s === "" ? null : s;
 };
-
+ 
 const toInt = (v) => {
   const s = clean(v);
   if (s === null) return null;
   const n = Number(s);
   return Number.isFinite(n) ? Math.trunc(n) : NaN;
 };
-
+ 
 // "" / null -> null, "1500" -> 1500, "abc" -> NaN
 const toPrice = (v) => {
   const s = clean(v);
@@ -58,13 +52,13 @@ const toPrice = (v) => {
   const n = Number(s);
   return Number.isFinite(n) && n >= 0 ? n : NaN;
 };
-
+ 
 async function canManageLists(db, userId) {
   if (!userId) return false;
   const r = await db.query("SELECT role_id FROM admin_user WHERE id = $1", [userId]);
   return r.rowCount > 0 && MANAGE_LIST_ROLE_IDS.includes(Number(r.rows[0].role_id));
 }
-
+ 
 const requireListManager = async (req, res, next) => {
   try {
     if (!(await canManageLists(pool, currentUserId(req)))) {
@@ -76,7 +70,7 @@ const requireListManager = async (req, res, next) => {
     return res.status(500).json({ message: "Server error" });
   }
 };
-
+ 
 // Lists + items of one department
 async function loadLists(db, departmentId, includeInactive) {
   const lists = await db.query(
@@ -98,7 +92,7 @@ async function loadLists(db, departmentId, includeInactive) {
   );
   return lists.rows.map((l) => ({ ...l, options: options.rows.filter((o) => o.listId === l.id) }));
 }
-
+ 
 /* ------------- GET /api/jobs/:id/complaint  (opens the form) -------------
    The job, the type lists of the job's department, the saved complaint (if any),
    the other departments (for "Shift To Other Department") and whether the user can edit the lists.
@@ -106,7 +100,7 @@ async function loadLists(db, departmentId, includeInactive) {
 router.get("/jobs/:id/complaint", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
   if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
-
+ 
   try {
     const jobRes = await pool.query(
       `SELECT j.id, j.job_no, j.reg_no, j.status, j.current_stage_no, j.department_id,
@@ -121,9 +115,9 @@ router.get("/jobs/:id/complaint", authenticateToken, async (req, res) => {
     if (jobRes.rowCount === 0) return res.status(404).json({ message: "Job not found" });
     const j = jobRes.rows[0];
     if (!j.department_id) return res.status(409).json({ message: "Select a department for this job first" });
-
+ 
     const lists = await loadLists(pool, j.department_id, false);
-
+ 
     const saved = await pool.query(
       `SELECT jc.id, jc.complaint, jc.remarks, jc.vehicle_pass_issued, jc.initial_customer_approval,
               jc.updated_at, trim(concat(u.first_name, ' ', u.last_name)) AS recorded_by_name,
@@ -153,14 +147,14 @@ router.get("/jobs/:id/complaint", authenticateToken, async (req, res) => {
         startConfirmedByName: s.start_confirmed_by_name,
       };
     }
-
+ 
     const others = await pool.query(
       `SELECT id, name FROM department
        WHERE is_active AND show_in_job_stage AND id <> $1
        ORDER BY sort_order, id`,
       [j.department_id]
     );
-
+ 
     return res.json({
       job: {
         id: j.id,
@@ -183,11 +177,7 @@ router.get("/jobs/:id/complaint", authenticateToken, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
-
-// ONLY THIS ROUTE CHANGED in complaint.routes.js:  router.post("/jobs/:id/complaint", ...)
-// Replace the existing  router.post("/jobs/:id/complaint", ...)  route (the comment above it too) with this one.
-// New: for Wash the complaint can be SAVED first and the job STARTED later (stage 5 stays open until the start is confirmed).
-
+ 
 /* ------------- POST /api/jobs/:id/complaint  (save) -------------
    Body: { complaint, remarks, vehiclePassIssued, initialCustomerApproval, startConfirmed, optionIds: [] }
    startConfirmed = the user answered Yes to "Are you sure about initial starting?" (Stage 4 A, Wash).
@@ -197,7 +187,7 @@ router.get("/jobs/:id/complaint", authenticateToken, async (req, res) => {
 router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
   if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
-
+ 
   const b = req.body || {};
   const complaint = clean(b.complaint);
   const remarks = clean(b.remarks);
@@ -207,16 +197,16 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
   const optionIds = [...new Set((Array.isArray(b.optionIds) ? b.optionIds : []).map(toInt))].filter((n) =>
     Number.isInteger(n)
   );
-
+ 
   if (!complaint && optionIds.length === 0) {
     return res.status(400).json({ message: "Write the complaint or select a type" });
   }
-
+ 
   const userId = currentUserId(req);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
+ 
     const jobRes = await client.query(
       `SELECT j.id, j.status, j.current_stage_no, j.department_id, d.requires_initial_approval
        FROM job j LEFT JOIN department d ON d.id = j.department_id
@@ -238,7 +228,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Select Initial Customer Approval (Yes / No)" });
     }
-
+ 
     // The selected items must belong to this department's active lists
     let picked = [];
     if (optionIds.length > 0) {
@@ -254,7 +244,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
         return res.status(400).json({ message: "Invalid selection" });
       }
       picked = opts.rows;
-
+ 
       const perList = {};
       for (const o of picked) {
         perList[o.list_id] = (perList[o.list_id] || 0) + 1;
@@ -264,7 +254,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
         }
       }
     }
-
+ 
     // Save (insert or update) the complaint
     const jc = await client.query(
       `INSERT INTO job_complaint
@@ -286,7 +276,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
       [jobId, complaint, remarks, vehiclePassIssued, approval, userId, startConfirmed]
     );
     const complaintId = jc.rows[0].id;
-
+ 
     // Selected types (name / price are copied)
     await client.query("DELETE FROM job_complaint_option WHERE job_complaint_id = $1", [complaintId]);
     for (const o of picked) {
@@ -297,7 +287,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
         [complaintId, o.id, o.title, o.concern_level, o.group_name, o.name, o.price]
       );
     }
-
+ 
     // Complete stage 5 and move to stage 6:
     //  - normal departments: on the first save
     //  - departments with "initial start" (Wash): only when the start is confirmed (Stage 4 A)
@@ -323,7 +313,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
     } else {
       await client.query("UPDATE job SET updated_at = CURRENT_TIMESTAMP WHERE id = $1", [jobId]);
     }
-
+ 
     await client.query("COMMIT");
     return res.json({
       message: "Complaint saved",
@@ -338,7 +328,7 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
     client.release();
   }
 });
-
+ 
 /* ------------- PATCH /api/jobs/:id/shift-department -------------
    "Shift To Other Department". Body: { departmentId, reason }
    Allowed only while the complaint window (stage 5) is open.
@@ -349,11 +339,11 @@ router.patch("/jobs/:id/shift-department", authenticateToken, async (req, res) =
   const reason = clean(req.body?.reason);
   if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
   if (!Number.isInteger(departmentId)) return res.status(400).json({ message: "Select a department" });
-
+ 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
+ 
     const jobRes = await client.query(
       "SELECT id, status, current_stage_no, department_id FROM job WHERE id = $1 FOR UPDATE",
       [jobId]
@@ -371,7 +361,7 @@ router.patch("/jobs/:id/shift-department", authenticateToken, async (req, res) =
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "The job is already in this department" });
     }
-
+ 
     const dept = await client.query(
       "SELECT id, name FROM department WHERE id = $1 AND is_active AND show_in_job_stage",
       [departmentId]
@@ -380,7 +370,7 @@ router.patch("/jobs/:id/shift-department", authenticateToken, async (req, res) =
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Invalid department" });
     }
-
+ 
     await client.query("UPDATE job SET department_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [
       departmentId,
       jobId,
@@ -390,7 +380,7 @@ router.patch("/jobs/:id/shift-department", authenticateToken, async (req, res) =
        VALUES ($1, $2, $3, $4, $5)`,
       [jobId, job.department_id, departmentId, reason, currentUserId(req)]
     );
-
+ 
     await client.query("COMMIT");
     return res.json({ message: "Job shifted", departmentName: dept.rows[0].name });
   } catch (error) {
@@ -401,11 +391,11 @@ router.patch("/jobs/:id/shift-department", authenticateToken, async (req, res) =
     client.release();
   }
 });
-
+ 
 /* =====================================================================
    MANAGE THE TYPE LISTS (add / alter / remove) - only for MANAGE_LIST_ROLE_IDS
    ===================================================================== */
-
+ 
 // All lists of a department, including removed items (for the "Manage lists" window)
 router.get("/departments/:id/complaint-lists", authenticateToken, requireListManager, async (req, res) => {
   const departmentId = toInt(req.params.id);
@@ -417,7 +407,7 @@ router.get("/departments/:id/complaint-lists", authenticateToken, requireListMan
     return res.status(500).json({ message: "Server error" });
   }
 });
-
+ 
 // Add an item (a removed item with the same name is brought back)
 router.post("/complaint-lists/:listId/options", authenticateToken, requireListManager, async (req, res) => {
   const listId = toInt(req.params.listId);
@@ -426,30 +416,47 @@ router.post("/complaint-lists/:listId/options", authenticateToken, requireListMa
   if (!Number.isInteger(listId)) return res.status(400).json({ message: "Invalid list" });
   if (!name) return res.status(400).json({ message: "Name is required" });
   if (Number.isNaN(price)) return res.status(400).json({ message: "Invalid price" });
-
+ 
   try {
+    // The same name cannot be added twice inside the same parent type (upper / lower case ignored).
+    // The same child name under two different parent types is fine.
+    const dup = await pool.query(
+      `SELECT id, is_active, group_name FROM complaint_option
+        WHERE list_id = $1 AND lower(btrim(name)) = lower(btrim($2::text))
+          AND lower(btrim(COALESCE(group_name, ''))) = lower(btrim(COALESCE($3::text, ''))) LIMIT 1`,
+      [listId, name, clean(req.body?.groupName)]
+    );
+    if (dup.rowCount > 0 && dup.rows[0].is_active) {
+      const where = dup.rows[0].group_name ? ` under "${dup.rows[0].group_name}"` : "";
+      return res.status(409).json({ message: `"${name}" already exists${where}.` });
+    }
+    if (dup.rowCount > 0) {   // it was removed before: bring it back
+      await pool.query(
+        `UPDATE complaint_option SET is_active = true, group_name = $2, description = $3, price = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [dup.rows[0].id, clean(req.body?.groupName), clean(req.body?.description), price]
+      );
+      return res.status(201).json({ id: dup.rows[0].id });
+    }
     const result = await pool.query(
       `INSERT INTO complaint_option (list_id, group_name, name, description, price, sort_order)
        VALUES ($1, $2, $3, $4, $5, COALESCE((SELECT max(sort_order) FROM complaint_option WHERE list_id = $1), 0) + 1)
-       ON CONFLICT (list_id, name) DO UPDATE SET
-         is_active = true, group_name = EXCLUDED.group_name, description = EXCLUDED.description,
-         price = EXCLUDED.price, updated_at = CURRENT_TIMESTAMP
        RETURNING id`,
       [listId, clean(req.body?.groupName), name, clean(req.body?.description), price]
     );
     return res.status(201).json({ id: result.rows[0].id });
   } catch (error) {
     if (error.code === "23503") return res.status(404).json({ message: "List not found" });
+    if (error.code === "23505") return res.status(409).json({ message: "This name already exists in the list. (To reuse a name under another parent type, run allow_same_child_name.sql.)" });
     console.error("Error adding option:", error);
     return res.status(500).json({ message: "Server error" });
   }
 });
-
+ 
 // Alter an item. Send only the fields that change: name, groupName, description, price, isActive, sortOrder
 router.patch("/complaint-options/:id", authenticateToken, requireListManager, async (req, res) => {
   const id = toInt(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: "Invalid item" });
-
+ 
   const b = req.body || {};
   const sets = [];
   const values = [];
@@ -457,7 +464,7 @@ router.patch("/complaint-options/:id", authenticateToken, requireListManager, as
     values.push(value);
     sets.push(`${column} = $${values.length}`);
   };
-
+ 
   if ("name" in b) {
     const name = clean(b.name);
     if (!name) return res.status(400).json({ message: "Name is required" });
@@ -477,7 +484,21 @@ router.patch("/complaint-options/:id", authenticateToken, requireListManager, as
     add("sort_order", n);
   }
   if (sets.length === 0) return res.status(400).json({ message: "Nothing to update" });
-
+ 
+  // no duplicate name inside the same parent type (checked with the name / group this item will have after the update)
+  if ("name" in b || "groupName" in b) {
+    const same = await pool.query(
+      `SELECT o.id FROM complaint_option me
+         JOIN complaint_option o ON o.list_id = me.list_id AND o.id <> me.id
+        WHERE me.id = $1
+          AND lower(btrim(o.name)) = lower(btrim(COALESCE($2::text, me.name)))
+          AND lower(btrim(COALESCE(o.group_name, ''))) = lower(btrim(CASE WHEN $4::boolean THEN COALESCE($3::text, '') ELSE COALESCE(me.group_name, '') END))
+        LIMIT 1`,
+      [id, "name" in b ? clean(b.name) : null, "groupName" in b ? clean(b.groupName) : null, "groupName" in b]
+    );
+    if (same.rowCount > 0) return res.status(409).json({ message: "An item with this name already exists in this type." });
+  }
+ 
   values.push(id);
   try {
     const result = await pool.query(
@@ -492,7 +513,7 @@ router.patch("/complaint-options/:id", authenticateToken, requireListManager, as
     return res.status(500).json({ message: "Server error" });
   }
 });
-
+ 
 // Remove an item. It is only switched off (is_active = false), so jobs that already used it keep their record.
 router.delete("/complaint-options/:id", authenticateToken, requireListManager, async (req, res) => {
   const id = toInt(req.params.id);
@@ -509,5 +530,6 @@ router.delete("/complaint-options/:id", authenticateToken, requireListManager, a
     return res.status(500).json({ message: "Server error" });
   }
 });
-
+ 
 module.exports = router;
+ 

@@ -21,6 +21,9 @@ const inspection= require("./routes/inspection");
 const spare= require("./routes/spare");
 const Inventory= require("./routes/Inventory");
 const inventoryfull= require("./routes/inventoryfull");
+const customer_approval= require("./routes/customer_approval");
+const internal_inspection= require("./routes/internal_inspection");
+const job_activation= require("./routes/job_activation");
 
 
 require('dotenv').config();
@@ -109,6 +112,9 @@ app.use("/inspection", inspection);
 app.use("/spare", spare); 
 app.use("/Inventory", Inventory); 
 app.use("/inventoryfull", inventoryfull); 
+app.use("/customer_approval", customer_approval); 
+app.use("/internal_inspection", internal_inspection); 
+app.use("/job_activation", job_activation); 
 
 
 

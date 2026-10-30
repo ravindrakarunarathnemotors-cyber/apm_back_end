@@ -84,7 +84,7 @@ const ITEM_SELECT = `SELECT id, description, repair_type AS "repairType", amount
  
 async function loadAll(db, job) {
   const jobId = job.id;
-  const [ins, items, files, repairs, concerns, hist] = await Promise.all([
+  const [ins, items, files, repairs, concerns, hist, groupRows, treeRows] = await Promise.all([
     db.query(
       `SELECT i.test_run AS "testRun", i.faults_found AS "faultsFound", i.previous_repair AS "previousRepair", i.new_repair AS "newRepair",
               i.warranty, i.history_remarks AS "historyRemarks", i.repair_types AS "repairTypes",
@@ -99,7 +99,37 @@ async function loadAll(db, job) {
     db.query(
       `SELECT job_no AS "jobNo", status, created_at AS "createdAt" FROM job WHERE reg_no = $1 AND id <> $2 ORDER BY id DESC LIMIT 5`,
       [job.regNo, jobId]),
+    // The repair types picked in the complaint stage (parents) and the child types (with labour price) defined under them
+    db.query(
+      `SELECT jco.option_name AS parent, c.id AS "childId", c.name AS "childName", c.price::float AS price
+       FROM job_complaint jc
+       JOIN job_complaint_option jco ON jco.job_complaint_id = jc.id AND jco.list_title ILIKE '%repair type%'
+       LEFT JOIN complaint_option p ON p.id = jco.option_id
+       LEFT JOIN complaint_option c ON c.list_id = p.list_id AND c.is_active
+            AND lower(btrim(c.group_name)) = lower(btrim(p.name))
+       WHERE jc.job_id = $1
+       ORDER BY jco.id, c.sort_order, c.id`, [jobId]),
+    // Every repair type of the department (so the mechanic can add one that was not picked in the complaint stage)
+    db.query(
+      `SELECT p.name AS parent, c.id AS "childId", c.name AS "childName", c.price::float AS price
+       FROM complaint_option_list l
+       JOIN complaint_option p ON p.list_id = l.id AND p.is_active AND btrim(COALESCE(p.group_name, '')) = ''
+       LEFT JOIN complaint_option c ON c.list_id = l.id AND c.is_active AND lower(btrim(c.group_name)) = lower(btrim(p.name))
+       WHERE l.department_id = $1 AND l.is_active AND l.title ILIKE '%repair type%'
+       ORDER BY p.sort_order, p.id, c.sort_order, c.id`, [job.departmentId]),
   ]);
+  const repairTree = [];
+  for (const r of treeRows.rows) {
+    let g = repairTree.find((x) => x.parent === r.parent);
+    if (!g) { g = { parent: r.parent, children: [] }; repairTree.push(g); }
+    if (r.childId) g.children.push({ id: r.childId, name: r.childName, price: r.price, label: `${r.parent} > ${r.childName}` });
+  }
+  const repairGroups = [];
+  for (const r of groupRows.rows) {
+    let g = repairGroups.find((x) => x.parent === r.parent);
+    if (!g) { g = { parent: r.parent, children: [] }; repairGroups.push(g); }
+    if (r.childId) g.children.push({ id: r.childId, name: r.childName, price: r.price, label: `${r.parent} > ${r.childName}` });
+  }
   const of = (k) => items.rows.filter((r) => r.kind === k).map((r) => r.description);
   const active = repairs.rows.filter((r) => r.status === "ACTIVE");
   const main = concerns.rows.filter((r) => r.name && r.level === "MAIN").map((r) => ({ title: r.listTitle, name: r.name }));
@@ -112,6 +142,7 @@ async function loadAll(db, job) {
     totalRepairValue: active.reduce((s, r) => s + Number(r.amount), 0),
     concerns: { complaint: concerns.rows[0]?.complaint || "", main, sub },
     history: hist.rows,
+    repairGroups, repairTree,
   };
 }
  
@@ -126,7 +157,8 @@ router.get("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     const data = await loadAll(pool, job);
     const signed = Boolean(data.inspection?.signedAt);
     const rights = await recordRights(req, job, signed);
-    return res.json({ job, ...data, signed, ...rights, repairTypes: REPAIR_TYPES });
+    const dynamic = data.repairGroups.flatMap((g) => [g.parent, ...g.children.map((c) => c.label)]);
+    return res.json({ job, ...data, signed, ...rights, repairTypes: dynamic.length ? dynamic : REPAIR_TYPES });
   } catch (error) {
     console.error("Error loading the job inspection:", error.code, error.message);
     return res.status(500).json({ message: "Server error" });
@@ -147,7 +179,7 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
   const identified = lines(b.identifiedFaults);
   const roots = lines(b.rootCauses);
   if ([...faults, ...identified, ...roots].some((x) => x.length > 300)) return res.status(400).json({ message: "A line is too long (max 300 characters)" });
-  const repairTypes = (Array.isArray(b.repairTypes) ? b.repairTypes : []).filter((t) => REPAIR_TYPES.includes(t));
+  const repairTypes = (Array.isArray(b.repairTypes) ? b.repairTypes : []).map((t) => String(t).trim()).filter((t) => t && t.length <= 200).slice(0, 100);
   const historyRemarks = clean(b.historyRemarks);
   if (historyRemarks && historyRemarks.length > 2000) return res.status(400).json({ message: "The history remarks are too long (max 2000 characters)" });
   const complete = b.complete === true;
@@ -240,7 +272,7 @@ const readItem = (b) => {
   if (!description) return { error: "Enter the repair item" };
   if (description.length > 300) return { error: "The repair item is too long (max 300 characters)" };
   if (!Number.isFinite(amount) || amount < 0 || amount > 999999999) return { error: "Enter a valid amount" };
-  if (repairType && !REPAIR_TYPES.includes(repairType)) return { error: "Invalid repair type" };
+  if (repairType && repairType.length > 200) return { error: "Invalid repair type" };
   return { description, amount: Math.round(amount * 100) / 100, repairType };
 };
  

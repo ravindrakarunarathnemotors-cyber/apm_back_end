@@ -795,9 +795,6 @@ router.post("/get-user-logs", authenticateToken, async (req, res) => {
 });
 
  
-
-
- 
 // The logged-in system user (admin_user.id) taken from the JWT set by authenticateToken.
 // Change "user_id" here if your token payload uses another key.
 const currentUserId = (req) => {
@@ -1266,13 +1263,8 @@ router.post("/jobs", authenticateToken, async (req, res) => {
   }
 });
  
-/* ------------------ GET /api/jobs (Jobs table) ------------------ */
-// Optional filter: GET /api/jobs?department=Mechanical  (used by the department dashboards)
-router.get("/jobs", authenticateToken, async (req, res) => {
-  const department = clean(req.query.department);
-  try {
-    const result = await pool.query(
-      `SELECT
+/* ------------------ Jobs table: shared SELECT / FROM ------------------ */
+const JOB_COLUMNS = `SELECT
          j.id,
          j.job_no                                        AS "jobNo",
          c.customer_name                                 AS "customerName",
@@ -1283,12 +1275,24 @@ router.get("/jobs", authenticateToken, async (req, res) => {
          d.name                                          AS "departmentName",
          COALESCE(d.requires_initial_approval, false)    AS "requiresStart",
          (jc.id IS NOT NULL)                             AS "complaintSaved",
+         COALESCE(d.has_team_allocation, false)          AS "requiresTeam",
+         (ta.id IS NOT NULL)                             AS "teamAllocated",
+         ta.team_name                                    AS "teamName",
+         COALESCE(d.has_bay_allocation, false)           AS "requiresBay",
+         (ba.id IS NOT NULL)                             AS "bayAllocated",
+         COALESCE(ba.bay_name, ta.bay_name)              AS "bayName",
          jc.start_confirmed_at                           AS "startedAt",
          trim(concat(sc.first_name, ' ', sc.last_name))  AS "startedByName",
          j.current_stage_no                              AS "stageNo",
-         COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
+         COALESCE(d.has_job_activation, false)           AS "activationEnabled",
+         ja.activated_at                                 AS "activatedAt",
+         COALESCE(CASE WHEN j.current_stage_no = 6 AND COALESCE(d.has_bay_allocation, false) AND NOT COALESCE(d.has_team_allocation, false) THEN 'Bay Allocation'
+                       WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
+                       WHEN COALESCE(d.has_customer_approval, false) AND j.current_stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
+                       WHEN COALESCE(d.has_internal_inspection, false) AND j.current_stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
+                       WHEN COALESCE(d.has_job_activation, false) AND j.current_stage_no = d.job_activation_stage_no THEN 'Job Activation'
                        WHEN COALESCE(d.has_damage_report, false) AND j.current_stage_no = d.damage_report_stage_no THEN 'Vehicle Damages Report' END, m.name)  AS "stageName",
          j.status,
          j.created_at                                    AS "createdAt",
@@ -1301,13 +1305,27 @@ router.get("/jobs", authenticateToken, async (req, res) => {
          (SELECT count(*)::int FROM job_stage_master)    AS "totalStages",
          (SELECT count(*)::int FROM job_stage s
            WHERE s.job_id = j.id AND s.status = 'COMPLETED') AS "completedStages"
-       FROM job j
+`;
+const JOB_FROM = `       FROM job j
        JOIN customer c   ON c.id = j.customer_id
        JOIN admin_user u ON u.id = j.consultant_id
        LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no
        LEFT JOIN department d ON d.id = j.department_id
        LEFT JOIN job_complaint jc ON jc.job_id = j.id
        LEFT JOIN admin_user sc ON sc.id = jc.start_confirmed_by
+       LEFT JOIN job_activation ja ON ja.job_id = j.id
+       LEFT JOIN job_team_allocation ta ON ta.job_id = j.id
+       LEFT JOIN job_bay_allocation ba ON ba.job_id = j.id
+`;
+ 
+/* ------------------ GET /api/jobs (dashboards, tab counts) ------------------ */
+// Optional filter: GET /api/jobs?department=Mechanical  (used by the department dashboards)
+router.get("/jobs", authenticateToken, async (req, res) => {
+  const department = clean(req.query.department);
+  try {
+    const result = await pool.query(
+      `${JOB_COLUMNS}
+       ${JOB_FROM}
        WHERE ($1::text IS NULL OR lower(d.name) = lower($1::text))
        ORDER BY j.id DESC
        LIMIT 200`,
@@ -1316,6 +1334,90 @@ router.get("/jobs", authenticateToken, async (req, res) => {
     return res.json(result.rows);
   } catch (error) {
     console.error("Error loading jobs:", error);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+ 
+/* ------------------ GET /api/jobs/summary (dashboard KPIs, department cards, tab counts) ------------------
+   Counts only, computed in SQL -> the dashboards no longer download every job.
+   (The newer stage columns are read through to_jsonb(d), so the summary keeps working even before the stage SQL files are run.)
+   -> { total, active, done, today, noDept, departments: [{ name, active, done, avgProgress, stages: [{ stageNo, stageName, n }] }] } */
+router.get("/jobs/summary", authenticateToken, async (req, res) => {
+  try {
+    const [tot, deps, stg] = await Promise.all([
+      pool.query(`SELECT count(*)::int AS total,
+                         count(*) FILTER (WHERE status = 'IN_PROGRESS')::int AS active,
+                         count(*) FILTER (WHERE status = 'COMPLETED')::int AS done,
+                         count(*) FILTER (WHERE created_at::date = CURRENT_DATE)::int AS today,
+                         count(*) FILTER (WHERE department_id IS NULL)::int AS "noDept"
+                  FROM job`),
+      pool.query(`SELECT d.name,
+                         count(j.id) FILTER (WHERE j.status = 'IN_PROGRESS')::int AS active,
+                         count(j.id) FILTER (WHERE j.status = 'COMPLETED')::int AS done,
+                         COALESCE(round(avg(CASE WHEN j.status = 'IN_PROGRESS' AND ms.n > 0 THEN 100.0 * cs.n / ms.n END)), 0)::int AS "avgProgress"
+                  FROM department d
+                  LEFT JOIN job j ON j.department_id = d.id
+                  LEFT JOIN LATERAL (SELECT count(*) AS n FROM job_stage s WHERE s.job_id = j.id AND s.status = 'COMPLETED') cs ON true
+                  CROSS JOIN (SELECT count(*) AS n FROM job_stage_master) ms
+                  GROUP BY d.name ORDER BY d.name`),
+      pool.query(`SELECT d.name AS dept, j.current_stage_no AS "stageNo",
+                         COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
+                                       WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
+                                       WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
+                                       WHEN COALESCE((to_jsonb(d)->>'has_customer_approval')::boolean, false) AND j.current_stage_no = (to_jsonb(d)->>'customer_approval_stage_no')::int THEN 'Customer Approval'
+                                       WHEN COALESCE((to_jsonb(d)->>'has_internal_inspection')::boolean, false) AND j.current_stage_no = (to_jsonb(d)->>'internal_inspection_stage_no')::int THEN 'Internal Inspection - 1'
+                                       WHEN COALESCE((to_jsonb(d)->>'has_job_activation')::boolean, false) AND j.current_stage_no = (to_jsonb(d)->>'job_activation_stage_no')::int THEN 'Job Activation'
+                                       WHEN COALESCE(d.has_damage_report, false) AND j.current_stage_no = d.damage_report_stage_no THEN 'Vehicle Damages Report' END, m.name) AS "stageName",
+                         count(*)::int AS n
+                  FROM job j JOIN department d ON d.id = j.department_id
+                  LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no
+                  WHERE j.status = 'IN_PROGRESS'
+                  GROUP BY d.name, j.current_stage_no, 3 ORDER BY j.current_stage_no`),
+    ]);
+    const departments = deps.rows.map((d) => ({ ...d, stages: stg.rows.filter((x) => x.dept === d.name).map(({ stageNo, stageName, n }) => ({ stageNo, stageName, n })) }));
+    return res.json({ ...tot.rows[0], departments });
+  } catch (error) {
+    console.error("Error loading jobs summary:", error);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+ 
+/* ------------------ GET /api/jobs/page (CRM Jobs table, paginated) ------------------
+   ?page=1&pageSize=10&search=&consultant=&department=&stage=
+   department = a name, or "__none__" for jobs without a department yet
+   -> { rows, total, page, pageSize, filters: { consultants, departments, stages } }
+   Must stay ABOVE GET /jobs/:id. */
+router.get("/jobs/page", authenticateToken, async (req, res) => {
+  const pageSize = [10, 25, 50, 100].includes(toInt(req.query.pageSize)) ? toInt(req.query.pageSize) : 10;
+  const search = (clean(req.query.search) || "").toLowerCase().replace(/[\s-]/g, "");
+  const consultant = clean(req.query.consultant);
+  const department = clean(req.query.department);
+  const stage = toInt(req.query.stage);
+  const status = ["IN_PROGRESS", "COMPLETED", "CANCELLED", "TODAY"].includes(req.query.status) ? req.query.status : null;   // dashboard KPI filter
+  const where = `
+       WHERE ($1::text = '' OR replace(replace(lower(concat_ws(' ', j.job_no, c.customer_name, c.contact_number, j.reg_no, u.first_name, u.last_name)), ' ', ''), '-', '') LIKE '%' || $1::text || '%')
+         AND ($2::text IS NULL OR trim(concat(u.first_name, ' ', u.last_name)) = $2::text)
+         AND ($3::text IS NULL OR (lower($3::text) = '__none__' AND d.id IS NULL) OR lower(d.name) = lower($3::text))
+         AND ($4::int IS NULL OR j.current_stage_no = $4::int)
+         AND ($5::text IS NULL OR ($5::text = 'TODAY' AND j.created_at::date = CURRENT_DATE) OR j.status = $5::text)`;
+  const params = [search, consultant, department, Number.isInteger(stage) ? stage : null, status];
+  try {
+    const count = await pool.query(`SELECT count(*)::int AS n ${JOB_FROM} ${where}`, params);
+    const total = count.rows[0].n;
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(Math.max(toInt(req.query.page) || 1, 1), pages);
+    const [rows, cons, deps, stages] = await Promise.all([
+      pool.query(`${JOB_COLUMNS} ${JOB_FROM} ${where} ORDER BY j.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, params),
+      pool.query(`SELECT DISTINCT trim(concat(u.first_name, ' ', u.last_name)) AS name FROM job j JOIN admin_user u ON u.id = j.consultant_id ORDER BY 1`),
+      pool.query(`SELECT DISTINCT d.name FROM job j JOIN department d ON d.id = j.department_id ORDER BY 1`),
+      pool.query(`SELECT DISTINCT j.current_stage_no AS "stageNo", m.name AS "stageName" FROM job j LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no ORDER BY 1`),
+    ]);
+    return res.json({
+      rows: rows.rows, total, page, pageSize,
+      filters: { consultants: cons.rows.map((r) => r.name).filter(Boolean), departments: deps.rows.map((r) => r.name), stages: stages.rows },
+    });
+  } catch (error) {
+    console.error("Error loading jobs page:", error);
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -1440,6 +1542,9 @@ router.get("/jobs/:id", authenticateToken, async (req, res) => {
          COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
+                       WHEN COALESCE(d.has_customer_approval, false) AND j.current_stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
+                       WHEN COALESCE(d.has_internal_inspection, false) AND j.current_stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
+                       WHEN COALESCE(d.has_job_activation, false) AND j.current_stage_no = d.job_activation_stage_no THEN 'Job Activation'
                        WHEN COALESCE(d.has_damage_report, false) AND j.current_stage_no = d.damage_report_stage_no THEN 'Vehicle Damages Report' END, m.name) AS stage_name,
          jc.start_confirmed_at,
          trim(concat(sc.first_name, ' ', sc.last_name)) AS start_confirmed_by_name,
@@ -1466,6 +1571,9 @@ router.get("/jobs/:id", authenticateToken, async (req, res) => {
          COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND s.stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND s.stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND s.stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
+                       WHEN COALESCE(d.has_customer_approval, false) AND s.stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
+                       WHEN COALESCE(d.has_internal_inspection, false) AND s.stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
+                       WHEN COALESCE(d.has_job_activation, false) AND s.stage_no = d.job_activation_stage_no THEN 'Job Activation'
                        WHEN COALESCE(d.has_damage_report, false) AND s.stage_no = d.damage_report_stage_no THEN 'Vehicle Damages Report' END, m.name) AS "stageName",
          s.status,
          s.started_at                                   AS "startedAt",

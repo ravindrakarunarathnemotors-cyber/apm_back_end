@@ -13,7 +13,7 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 
-
+  
 const clean = (v) => {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
@@ -144,11 +144,12 @@ router.put("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req,
   try {
     const g = await guard(req, res); if (!g) return;
     const b = req.body || {};
-    const cur = await pool.query("SELECT qty, unit_price::float AS price, brand, name FROM job_spare_part WHERE id = $1 AND job_id = $2", [itemId, g.jobId]);
+    const cur = await pool.query("SELECT qty, unit_price::float AS price, brand, name, (reserved_qty + issued_qty - returned_qty)::float AS held FROM job_spare_part WHERE id = $1 AND job_id = $2", [itemId, g.jobId]);
     if (cur.rowCount === 0) return res.status(404).json({ message: "Spare part not found" });
     const qty = b.qty === undefined ? cur.rows[0].qty : toInt(b.qty);
     const price = b.unitPrice === undefined ? cur.rows[0].price : toMoney(b.unitPrice);
     if (!(qty >= 1 && qty <= 9999)) return res.status(400).json({ message: "Enter a valid quantity" });
+    if (qty < cur.rows[0].held) return res.status(400).json({ message: `${cur.rows[0].held} is already reserved / issued for this part. Release or return it first.` });
     if (Number.isNaN(price)) return res.status(400).json({ message: "Enter a valid price" });
     const name = b.name === undefined ? cur.rows[0].name : clean(b.name);
     if (!name || name.length > 200) return res.status(400).json({ message: "Enter the spare part name" });
@@ -166,6 +167,13 @@ router.delete("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (r
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
   try {
     const g = await guard(req, res); if (!g) return;
+    // stock rules: issued parts must be returned first; a reservation is released back to stock
+    const cur = await pool.query("SELECT part_id, reserved_qty::float AS reserved, (issued_qty - returned_qty)::float AS net, reserve_location_id AS loc FROM job_spare_part WHERE id = $1 AND job_id = $2", [itemId, g.jobId]);
+    if (cur.rowCount > 0) {
+      const c = cur.rows[0];
+      if (c.net > 0) return res.status(400).json({ message: "This part is already issued. Return it to stock first (Inventory > Spare Part Orders)." });
+      if (c.reserved > 0 && c.part_id && c.loc) await pool.query("UPDATE stock_balance SET qty_reserved = GREATEST(0, qty_reserved - $3) WHERE part_id = $1 AND location_id = $2", [c.part_id, c.loc, c.reserved]);
+    }
     await pool.query("DELETE FROM job_spare_part WHERE id = $1 AND job_id = $2", [itemId, g.jobId]);
     return reply(res, g.jobId);
   } catch (e) { console.error("remove spare part:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
@@ -256,12 +264,15 @@ router.post("/jobs/:id/spare-parts/complete", authenticateToken, async (req, res
 router.get("/spare-parts/catalog", authenticateToken, async (req, res) => {
   try {
     const q = clean(req.query.q), quality = clean(req.query.quality), all = req.query.all === "1";
+    const asked = parseInt(req.query.limit, 10);
+    const limit = all ? 200 : Number.isInteger(asked) ? Math.min(Math.max(asked, 1), 50) : 15;   // ?limit=5 -> only the first 5
     const r = await pool.query(
-      `SELECT id, part_no AS "partNo", name, brand, quality, price::float AS price, stock_qty AS "stockQty", is_active AS "isActive"
+      `SELECT id, part_no AS "partNo", sku, oem_no AS "oemNo", name, brand, quality, price::float AS price, stock_qty AS "stockQty", is_active AS "isActive"
        FROM spare_part
-       WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%' OR brand ILIKE '%' || $1 || '%' OR part_no ILIKE '%' || $1 || '%')
+       WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%' OR brand ILIKE '%' || $1 || '%' OR part_no ILIKE '%' || $1 || '%'
+              OR sku ILIKE '%' || $1 || '%' OR oem_no ILIKE '%' || $1 || '%' OR barcode ILIKE '%' || $1 || '%')
          AND ($2::text IS NULL OR quality = $2) AND ($3::boolean OR is_active)
-       ORDER BY name, id LIMIT ${all ? 200 : 15}`, [q, quality, all]);
+       ORDER BY name, id LIMIT ${limit}`, [q, quality, all]);
     return res.json(r.rows);
   } catch (e) { console.error("catalog search:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });

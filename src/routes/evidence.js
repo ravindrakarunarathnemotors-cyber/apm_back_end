@@ -24,7 +24,7 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 
- // The stage number of the evidence stage is per department (department.evidence_stage_no, default 7;
+// The stage number of the evidence stage is per department (department.evidence_stage_no, default 7;
 // Detailing = 6, because it has no team / bay stage before it).
 const DEFAULT_EVIDENCE_STAGE_NO = 7;
 // Who may add / rename / remove checklist items:  [] = every logged-in user,  [1] = only role_id 1 (admin)
@@ -77,7 +77,10 @@ router.get("/evidence-department/:name", authenticateToken, async (req, res) => 
       `SELECT id, name, COALESCE(has_vehicle_evidence, false) AS "hasVehicleEvidence",
               COALESCE(evidence_stage_no, ${DEFAULT_EVIDENCE_STAGE_NO}) AS "evidenceStageNo",
               COALESCE(has_job_inspection, false) AS "hasJobInspection", job_inspection_stage_no AS "jobInspectionStageNo",
-              COALESCE(has_spare_parts, false) AS "hasSpareParts", spare_parts_stage_no AS "spareStageNo"
+              COALESCE(has_spare_parts, false) AS "hasSpareParts", spare_parts_stage_no AS "spareStageNo",
+              COALESCE(has_customer_approval, false) AS "hasCustomerApproval", customer_approval_stage_no AS "approvalStageNo",
+              COALESCE(has_internal_inspection, false) AS "hasInternalInspection", internal_inspection_stage_no AS "internalStageNo",
+              COALESCE(has_job_activation, false) AS "hasJobActivation", job_activation_stage_no AS "activationStageNo"
        FROM department WHERE lower(name) = lower($1) AND is_active`,
       [name]
     );
