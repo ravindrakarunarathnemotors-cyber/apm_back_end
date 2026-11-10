@@ -13,7 +13,7 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 
-  
+
 const clean = (v) => {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
@@ -40,14 +40,18 @@ async function loadJob(db, jobId) {
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
             j.department_id AS "departmentId", d.name AS "departmentName",
             COALESCE(d.has_spare_parts, false) AS "hasSpareParts", d.spare_parts_stage_no AS "spareStageNo",
+            COALESCE(d.has_job_inspection, false) AS "hasJobInspection", d.job_inspection_stage_no AS "inspectionStageNo",
             c.customer_name AS "customerName"
      FROM job j JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`, [jobId]);
   return r.rows[0] || null;
 }
-const reached = (job) => job.status === "IN_PROGRESS" && job.hasSpareParts && job.stageNo >= job.spareStageNo;
+// The spare parts are now recorded inside the Vehicle Job Inspection window, so they can be added already while the inspection stage
+// (the stage right before the spare parts stage) is open. Signing the inspection completes the spare parts stage as well.
+const reached = (job) => job.status === "IN_PROGRESS" && job.hasSpareParts
+  && (job.stageNo >= job.spareStageNo || (job.hasJobInspection && job.stageNo === job.inspectionStageNo && job.inspectionStageNo + 1 === job.spareStageNo));
  
 const ITEM_SELECT = `SELECT id, part_id AS "partId", name, brand, quality, qty, unit_price::float AS "unitPrice", price_source AS "priceSource",
-                            stock_status AS "stockStatus", note FROM job_spare_part`;
+                            stock_status AS "stockStatus", note, COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part`;
 const QUOTE_SELECT = `SELECT id, photo_url AS "photoUrl", description, status, quoted_price::float AS "quotedPrice", quoted_note AS "quotedNote", quoted_at AS "quotedAt" FROM job_spare_quote`;
  
 async function options(db) {
@@ -60,7 +64,7 @@ async function listState(db, jobId) {
     db.query(`${QUOTE_SELECT} WHERE job_id = $1 ORDER BY id`, [jobId]),
     db.query(`SELECT no_parts_needed AS "noParts", link_token AS "linkToken", link_sent_at AS "linkSentAt", logistics_updated_at AS "logisticsUpdatedAt", completed_at AS "completedAt" FROM job_spare_parts WHERE job_id = $1`, [jobId]),
   ]);
-  const total = items.rows.reduce((s, r) => s + r.qty * r.unitPrice, 0)
+  const total = items.rows.filter((r) => !r.warrantyClaim).reduce((s, r) => s + r.qty * r.unitPrice, 0)
     + quotes.rows.filter((q) => q.quotedPrice != null).reduce((s, q) => s + q.quotedPrice, 0);
   return { items: items.rows, quotes: quotes.rows, header: head.rows[0] || { noParts: false, linkToken: null, linkSentAt: null, logisticsUpdatedAt: null, completedAt: null }, totalSparePartsValue: Math.round(total * 100) / 100 };
 }
@@ -69,7 +73,7 @@ async function listState(db, jobId) {
 async function previousStage(db, jobId) {
   const [items, repairs, concerns] = await Promise.all([
     db.query("SELECT kind, description FROM job_inspection_item WHERE job_id = $1 ORDER BY kind, sort_order, id", [jobId]).catch(() => ({ rows: [] })),
-    db.query("SELECT description, repair_type AS \"repairType\", amount::float AS amount FROM job_repair_item WHERE job_id = $1 AND status = 'ACTIVE' ORDER BY id", [jobId]).catch(() => ({ rows: [] })),
+    db.query("SELECT description, repair_type AS \"repairType\", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS \"unitPrice\", COALESCE(warranty_claim, false) AS \"warrantyClaim\" FROM job_repair_item WHERE job_id = $1 AND status = 'ACTIVE' ORDER BY id", [jobId]).catch(() => ({ rows: [] })),
     db.query(`SELECT jc.complaint, o.concern_level AS level, o.option_name AS name FROM job_complaint jc LEFT JOIN job_complaint_option o ON o.job_complaint_id = jc.id WHERE jc.job_id = $1 ORDER BY o.id`, [jobId]),
   ]);
   const of = (k) => items.rows.filter((r) => r.kind === k).map((r) => r.description);
@@ -162,6 +166,18 @@ router.put("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req,
   } catch (e) { console.error("update spare part:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
  
+// PATCH /jobs/:id/spare-parts/items/:itemId/warranty   { claim }   -> mark / unmark a spare part as a warranty claim (not charged)
+router.patch("/jobs/:id/spare-parts/items/:itemId/warranty", authenticateToken, async (req, res) => {
+  const itemId = toInt(req.params.itemId);
+  if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
+  try {
+    const g = await guard(req, res); if (!g) return;
+    const r = await pool.query("UPDATE job_spare_part SET warranty_claim = $3::boolean, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND job_id = $2 RETURNING id", [itemId, g.jobId, Boolean(req.body?.claim)]);
+    if (r.rowCount === 0) return res.status(404).json({ message: "Spare part not found" });
+    return reply(res, g.jobId);
+  } catch (e) { console.error("spare part warranty:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+});
+ 
 router.delete("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
@@ -209,8 +225,9 @@ router.post("/jobs/:id/spare-parts/link", authenticateToken, async (req, res) =>
     await pool.query("UPDATE job_spare_quote SET status = 'SENT' WHERE job_id = $1 AND status = 'REQUESTED'", [g.jobId]);
     let sms = null;
     const base = String(process.env.PUBLIC_APP_URL || req.headers.origin || "").replace(/\/+$/, "");
-    if (process.env.LOGISTICS_SMS_NUMBER && base) {
-      sms = await sendSms(process.env.LOGISTICS_SMS_NUMBER, `Spare parts request for ${g.job.regNo} (${g.job.jobNo}): ${base}/spare-parts/${token}`);
+    const logi = await getLogisticsNumber();
+    if (logi && base) {
+      sms = await sendSms(logi, await renderSms("spareRequest", { regNo: g.job.regNo, jobNo: g.job.jobNo, link: `${base}/spare-parts/${token}` }), { kind: "spareRequest" });
     }
     return res.json({ token, path: `/spare-parts/${token}`, sms, ...(await listState(pool, g.jobId)) });
   } catch (e) { console.error("spare parts link:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
@@ -220,7 +237,10 @@ router.post("/jobs/:id/spare-parts/link", authenticateToken, async (req, res) =>
 router.put("/jobs/:id/spare-parts", authenticateToken, async (req, res) => {
   try {
     const g = await guard(req, res); if (!g) return;
-    await pool.query("UPDATE job_spare_parts SET no_parts_needed = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [req.body?.noParts === true, g.jobId]);
+    await pool.query(
+      `INSERT INTO job_spare_parts (job_id, no_parts_needed, saved_by) VALUES ($1, $2, $3)
+       ON CONFLICT (job_id) DO UPDATE SET no_parts_needed = EXCLUDED.no_parts_needed, updated_at = CURRENT_TIMESTAMP`,
+      [g.jobId, req.body?.noParts === true, currentUserId(req)]);
     return reply(res, g.jobId);
   } catch (e) { console.error("spare parts header:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
@@ -235,6 +255,7 @@ router.post("/jobs/:id/spare-parts/complete", authenticateToken, async (req, res
     const job = await loadJob(client, jobId);
     if (!job) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Job not found" }); }
     if (!reached(job)) { await client.query("ROLLBACK"); return res.status(409).json({ message: "This job is not ready for the spare parts stage" }); }
+    if (job.stageNo < job.spareStageNo) { await client.query("ROLLBACK"); return res.status(409).json({ message: "Sign the Vehicle Job Inspection to complete the spare parts stage" }); }
     await client.query("INSERT INTO job_spare_parts (job_id, saved_by) VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING", [jobId, currentUserId(req)]);
     const h = await client.query("SELECT no_parts_needed, completed_at FROM job_spare_parts WHERE job_id = $1 FOR UPDATE", [jobId]);
     if (h.rows[0].completed_at) { await client.query("ROLLBACK"); return res.status(409).json({ message: "Already completed" }); }

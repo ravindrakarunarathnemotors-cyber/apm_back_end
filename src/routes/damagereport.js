@@ -1,32 +1,20 @@
+// routes/damage_report.routes.js   (NEW file)
+// Stage 8 "Vehicle Damages Report" (departments with has_damage_report = true, Mechanical for now). The stage can be skipped.
+//   considerable damages (a, b, c) -> report sent to the customer (evidence report link) -> customer is asked
+//   "deep check?" / "repair?" -> what was agreed (Repair / Deep check / Both) -> link sent to the customer to confirm
+//   -> Customer confirmed (Yes / No).  Confirmed items are shown as "Sub concern" in the stage 7 inspection sheet.
+// Mount (same prefix as evidence.routes.js):  app.use("/evidence", require("./routes/damage_report.routes"));      (needs express.json())
+// Run create_damage_report_tables.sql first.
 const express = require("express");
-const authenticateToken = require("../middleware/authMiddleware");
-const pool = require("../config/db");
-const { formatPhoneNumber, getBrandingSetting, insertAdminlogs } = require("../models/userModels")
-const bcrypt = require("bcrypt");
-const dayjs = require('dayjs');
-const utc = require('dayjs/plugin/utc');
-const timezone = require('dayjs/plugin/timezone');
-const { customhookInvoice, sendProvisioningEmailPostmark, customhookQuotation } = require("../models/smstempmodels");
-const { Client } = require('ssh2');
-const CryptoJS = require('crypto-js');
-const axios = require('axios');
-const jwt = require("jsonwebtoken");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
 const { randomBytes } = require("node:crypto");
-const S3Service = require('./s3Service');
-
-dayjs.extend(utc);
-dayjs.extend(timezone);
-
-
 const router = express.Router();
- 
+const pool = require("../config/db");
+const authenticateToken = require("../middleware/authMiddleware");
+
 const DEFAULT_REPORT_STAGE_NO = 8;
 const ACTIONS = ["REPAIR", "DEEP_CHECK", "BOTH"];
 const DECISIONS = ["CONFIRMED", "DECLINED"];
- 
+
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
   return Number.isInteger(n) ? n : null;
@@ -43,7 +31,7 @@ const toInt = (v) => {
   return Number.isInteger(n) ? n : NaN;
 };
 const toBool = (v) => (v === true || v === "true" ? true : v === false || v === "false" ? false : null);
- 
+
 /* ---------- helpers ---------- */
 const JOB_SQL = `
   SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
@@ -51,7 +39,7 @@ const JOB_SQL = `
          COALESCE(d.has_damage_report, false) AS "hasDamageReport",
          COALESCE(d.damage_report_stage_no, ${DEFAULT_REPORT_STAGE_NO}) AS "reportStageNo"
   FROM job j LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`;
- 
+
 async function loadReport(db, jobId) {
   const [rep, dmg, agr, lnk] = await Promise.all([
     db.query(
@@ -70,7 +58,7 @@ async function loadReport(db, jobId) {
   const damages = dmg.rows.map((d, n) => ({ description: d.description, fileIds: lnk.rows.filter((l) => l.damage_no === n + 1).map((l) => l.file_id) }));
   return { ...rep.rows[0], damages, agreed: agr.rows };
 }
- 
+
 // every photo / video of the job (evidence stage + the ones added in the report)
 const loadJobFiles = async (db, jobId) =>
   (await db.query(
@@ -78,10 +66,13 @@ const loadJobFiles = async (db, jobId) =>
      FROM job_evidence_file WHERE job_id = $1 ORDER BY id`,
     [jobId]
   )).rows;
- 
-// The stage is finished when it was skipped, or nothing needs a deep check / repair, or the customer has answered.
-const isFinished = (r) => Boolean(r && (r.skipped || (r.needDeepCheck === false && r.needRepair === false) || r.decision));
- 
+
+// The stage is finished when it was skipped, or nothing needs a deep check / repair, or the customer has answered,
+// or the staff has answered both questions, written what was agreed and the link has been sent to the customer
+// (the job does not wait for the customer: the customer can confirm later).
+const isFinished = (r) => Boolean(r && (r.skipped || (r.needDeepCheck === false && r.needRepair === false) || r.decision ||
+  (r.confirmSentAt && r.needDeepCheck !== null && r.needDeepCheck !== undefined && r.needRepair !== null && r.needRepair !== undefined && r.agreed && r.agreed.length > 0)));
+
 // Completes the report stage (and moves the job on) when the job is exactly at that stage and the report is finished.
 async function completeIfFinished(client, jobId, reportStageNo, userId) {
   const job = await client.query("SELECT status, current_stage_no FROM job WHERE id = $1 FOR UPDATE", [jobId]);
@@ -96,7 +87,7 @@ async function completeIfFinished(client, jobId, reportStageNo, userId) {
   await client.query("UPDATE job SET current_stage_no = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [next, jobId]);
   return next;
 }
- 
+
 /* ================= lookup by department NAME ================= */
 // GET /api/damage-report-department/:name -> { id, name, hasDamageReport, damageReportStageNo }
 router.get("/damage-report-department/:name", authenticateToken, async (req, res) => {
@@ -116,7 +107,7 @@ router.get("/damage-report-department/:name", authenticateToken, async (req, res
     return res.status(500).json({ message: "Server error" });
   }
 });
- 
+
 /* ================= the report of a job ================= */
 // GET /api/jobs/:id/damage-report
 router.get("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
@@ -128,7 +119,7 @@ router.get("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
     const job = jr.rows[0];
     if (!job.departmentId) return res.status(409).json({ message: "This job has no department yet" });
     if (!job.hasDamageReport) return res.status(409).json({ message: `The damages report is not used in the ${job.departmentName} department` });
- 
+
     const [report, ev, evDamages, files] = await Promise.all([
       loadReport(pool, jobId),
       pool.query(`SELECT link_token AS "linkToken", link_sent_at AS "linkSentAt" FROM job_evidence WHERE job_id = $1`, [jobId]),
@@ -149,7 +140,7 @@ router.get("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
- 
+
 // PUT /api/jobs/:id/damage-report
 //   { skip: true }                                                    -> "Skip this step: Yes"
 //   { skip: false, damages: [".."], needDeepCheck, needRepair, agreed: [{ description, action: REPAIR|DEEP_CHECK|BOTH }] }
@@ -158,7 +149,7 @@ router.put("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
   if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
   const b = req.body || {};
   const skip = b.skip === true || b.skip === "true";
- 
+
   let damages = [];
   let needDeep = null;
   let needRepair = null;
@@ -185,7 +176,7 @@ router.put("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
       if (agreed.length === 0) return res.status(400).json({ message: "Write what was agreed to do (a, b, c ...)" });
     }
   }
- 
+
   const userId = currentUserId(req);
   const client = await pool.connect();
   try {
@@ -209,7 +200,7 @@ router.put("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "The customer has already answered. Reset the answer first to change the report." });
     }
- 
+
     await client.query(
       `INSERT INTO job_damage_report (job_id, skipped, need_deep_check, need_repair, saved_by) VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (job_id) DO UPDATE SET skipped = EXCLUDED.skipped, need_deep_check = EXCLUDED.need_deep_check,
@@ -237,7 +228,7 @@ router.put("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
     for (let n = 0; n < agreed.length; n++) {
       await client.query("INSERT INTO job_damage_report_agreed (job_id, description, action, sort_order) VALUES ($1, $2, $3, $4)", [jobId, agreed[n].description, agreed[n].action, n + 1]);
     }
- 
+
     const stageNo = await completeIfFinished(client, jobId, job.reportStageNo, userId);
     if (stageNo === job.stageNo) await client.query("UPDATE job SET updated_at = CURRENT_TIMESTAMP WHERE id = $1", [jobId]);
     await client.query("COMMIT");
@@ -250,23 +241,35 @@ router.put("/jobs/:id/damage-report", authenticateToken, async (req, res) => {
     client.release();
   }
 });
- 
-// POST /api/jobs/:id/damage-report/link -> { token, path }   private link for the customer to confirm what was agreed
+
+// POST /api/jobs/:id/damage-report/link -> { token, path, stageCompleted }   private link for the customer to confirm what was agreed
+// Once the questions are answered and the agreed work is written, sending the link also finishes the stage (the job moves on).
 router.post("/jobs/:id/damage-report/link", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
   if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
+  const userId = currentUserId(req);
+  const client = await pool.connect();
   try {
-    const rep = await loadReport(pool, jobId);
-    if (!rep || rep.skipped) return res.status(409).json({ message: "Save the damages report first" });
+    await client.query("BEGIN");
+    const jr = await client.query(JOB_SQL.replace("WHERE j.id = $1", "WHERE j.id = $1 FOR UPDATE OF j"), [jobId]);
+    if (jr.rowCount === 0) { await client.query("ROLLBACK"); return res.status(404).json({ message: "Job not found" }); }
+    const job = jr.rows[0];
+    const rep = await loadReport(client, jobId);
+    if (!rep || rep.skipped) { await client.query("ROLLBACK"); return res.status(409).json({ message: "Save the damages report first" }); }
     const token = rep.confirmToken || randomBytes(24).toString("hex");
-    await pool.query("UPDATE job_damage_report SET confirm_token = $1, confirm_sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, jobId]);
-    return res.json({ message: "Customer link ready", token, path: `/damage-report/${token}` });
+    await client.query("UPDATE job_damage_report SET confirm_token = $1, confirm_sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, jobId]);
+    const stageNo = await completeIfFinished(client, jobId, job.reportStageNo, userId);
+    await client.query("COMMIT");
+    return res.json({ message: "Customer link ready", token, path: `/damage-report/${token}`, currentStageNo: stageNo, stageCompleted: stageNo !== job.stageNo });
   } catch (error) {
+    try { await client.query("ROLLBACK"); } catch (_) { /* ignore */ }
     console.error("Error creating the damage report link:", error.code, error.message);
     return res.status(500).json({ message: "Server error" });
+  } finally {
+    client.release();
   }
 });
- 
+
 // POST /api/jobs/:id/damage-report/decision   { decision: "CONFIRMED" | "DECLINED" | null, note? }
 // Staff records the customer's answer (e.g. given by phone). decision null = reset the answer.
 router.post("/jobs/:id/damage-report/decision", authenticateToken, async (req, res) => {
@@ -311,10 +314,10 @@ router.post("/jobs/:id/damage-report/decision", authenticateToken, async (req, r
     client.release();
   }
 });
- 
+
 /* ================= public pages for the customer (NO login - the long random token is the key) ================= */
 const validToken = (t) => Boolean(t && /^[a-f0-9]{16,64}$/.test(t));
- 
+
 // GET /api/public/damage-report/:token  (no customer data is returned)
 router.get("/public/damage-report/:token", async (req, res) => {
   const token = clean(req.params.token);
@@ -338,7 +341,7 @@ router.get("/public/damage-report/:token", async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
- 
+
 // POST /api/public/damage-report/:token/decision   { decision: "CONFIRMED" | "DECLINED", note? }  - answers only once
 router.post("/public/damage-report/:token/decision", async (req, res) => {
   const token = clean(req.params.token);
@@ -381,6 +384,5 @@ router.post("/public/damage-report/:token/decision", async (req, res) => {
     client.release();
   }
 });
- 
+
 module.exports = router;
- 

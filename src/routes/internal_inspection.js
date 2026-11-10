@@ -46,7 +46,7 @@ const toInt = (v) => {
   const n = Number(s);
   return Number.isInteger(n) ? n : NaN;
 };
-
+ 
 async function loadJob(db, jobId) {
   const r = await db.query(
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
@@ -57,7 +57,7 @@ async function loadJob(db, jobId) {
   return r.rows[0] || null;
 }
 const reached = (job) => job.status === "IN_PROGRESS" && job.hasStage && job.stageNoOfThis && job.stageNo >= job.stageNoOfThis;
-
+ 
 async function state(db, job) {
   const [items, checks, extras, head, approval, parts] = await Promise.all([
     db.query(`SELECT id, section, label FROM internal_inspection_item WHERE department_id = $1 AND is_active ORDER BY sort_order, id`, [job.departmentId]),
@@ -79,7 +79,7 @@ async function state(db, job) {
     parts: parts.rows,
   };
 }
-
+ 
 // GET /jobs/:id/internal-inspection
 router.get("/jobs/:id/internal-inspection", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -92,7 +92,7 @@ router.get("/jobs/:id/internal-inspection", authenticateToken, async (req, res) 
     return res.json({ job, ...st, reached: reached(job), canRecord: reached(job) && !st.header.completedAt });
   } catch (e) { console.error("load internal inspection:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
-
+ 
 async function guard(req, res) {
   const jobId = toInt(req.params.id);
   if (!Number.isInteger(jobId)) { res.status(400).json({ message: "Invalid job" }); return null; }
@@ -103,7 +103,7 @@ async function guard(req, res) {
   if (h.rows[0]?.completed_at) { res.status(409).json({ message: "This stage is already completed" }); return null; }
   return { job, jobId };
 }
-
+ 
 // PUT /jobs/:id/internal-inspection   { checkedItemIds: [], extras: [{ section, label, checked }], notes }
 router.put("/jobs/:id/internal-inspection", authenticateToken, async (req, res) => {
   const g = await guard(req, res); if (!g) return;
@@ -139,7 +139,7 @@ router.put("/jobs/:id/internal-inspection", authenticateToken, async (req, res) 
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
-
+ 
 // POST /jobs/:id/internal-inspection/reminder   { kind: "LOGISTICS" | "CUSTOMER" }
 //   LOGISTICS = "Send reminders to the Logistic and Spare parts division" (SMS with the spare parts link when LOGISTICS_SMS_NUMBER is set)
 //   CUSTOMER  = "Send customer reminders to bring spare parts" (recorded; the browser opens WhatsApp)
@@ -154,8 +154,9 @@ router.post("/jobs/:id/internal-inspection/reminder", authenticateToken, async (
       const token = cur.rows[0]?.link_token || randomBytes(24).toString("hex");
       await pool.query("UPDATE job_spare_parts SET link_token = $1, link_sent_at = COALESCE(link_sent_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, g.jobId]);
       const base = String(process.env.PUBLIC_APP_URL || req.headers.origin || "").replace(/\/+$/, "");
-      if (process.env.LOGISTICS_SMS_NUMBER && base) {
-        sms = await sendSms(process.env.LOGISTICS_SMS_NUMBER, `Reminder: spare parts for ${g.job.regNo} (${g.job.jobNo}) are needed for the repair. ${base}/spare-parts/${token}`);
+      const logi = await getLogisticsNumber();
+      if (logi && base && (await getSmsSettings()).spareReminderOn !== false) {
+        sms = await sendSms(logi, await renderSms("spareReminder", { regNo: g.job.regNo, jobNo: g.job.jobNo, link: `${base}/spare-parts/${token}` }), { kind: "spareReminder" });
       }
     }
     const col = kind === "LOGISTICS" ? "logistics_reminder_at" : "customer_reminder_at";
@@ -165,7 +166,7 @@ router.post("/jobs/:id/internal-inspection/reminder", authenticateToken, async (
     return res.json({ sms, ...(await state(pool, g.job)) });
   } catch (e) { console.error("internal inspection reminder:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
-
+ 
 // POST /jobs/:id/internal-inspection/complete
 router.post("/jobs/:id/internal-inspection/complete", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -196,5 +197,6 @@ router.post("/jobs/:id/internal-inspection/complete", authenticateToken, async (
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
-
+ 
 module.exports = router;
+ 

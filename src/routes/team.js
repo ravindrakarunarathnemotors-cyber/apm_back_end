@@ -1,27 +1,12 @@
+// routes/team.routes.js   (NEW file)
+// Stage 6 "Team Allocation" (teams + bays) for the departments that use it (department.has_team_allocation,
+// only Mechanical for now) + the Teams / Bays lists (add / edit / active-inactive).
+// Mount in your app:  app.use("/api", require("./routes/team.routes"));
+// Needs app.use(express.json()). Run create_team_allocation_tables.sql first.
 const express = require("express");
-const authenticateToken = require("../middleware/authMiddleware");
-const pool = require("../config/db");
-const { formatPhoneNumber, getBrandingSetting, insertAdminlogs } = require("../models/userModels")
-const bcrypt = require("bcrypt");
-const dayjs = require('dayjs');
-const utc = require('dayjs/plugin/utc');
-const timezone = require('dayjs/plugin/timezone');
-const { customhookInvoice, sendProvisioningEmailPostmark, customhookQuotation } = require("../models/smstempmodels");
-const { Client } = require('ssh2');
-const CryptoJS = require('crypto-js');
-const axios = require('axios');
-const jwt = require("jsonwebtoken");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-
-const S3Service = require('./s3Service');
-
-dayjs.extend(utc);
-dayjs.extend(timezone);
-
-
 const router = express.Router();
+const pool = require("../config/db"); // <-- adjust
+const authenticateToken = require("../middleware/authMiddleware"); // <-- adjust
 
 const TEAM_STAGE_NO = 6;
 
@@ -45,6 +30,8 @@ const toInt = (v) => {
   return Number.isInteger(n) ? n : NaN;
 };
 const toBool = (v) => (v === true || v === "true" ? true : v === false || v === "false" ? false : null);
+
+const { requirePermission } = require("./permissions"); // action permissions: team.manage / bay.manage
 
 async function canManage(req) {
   if (MANAGE_ROLE_IDS.length === 0) return true;
@@ -202,7 +189,7 @@ async function saveMembers(client, teamId, v) {
 }
 
 // POST /api/departments/:id/teams   { name, leaderId, subLeaderId?, memberIds?: [], bayId? | newBayName?, isActive? }
-router.post("/departments/:id/teams", authenticateToken, manageOnly, async (req, res) => {
+router.post("/departments/:id/teams", authenticateToken, requirePermission("team.manage"), async (req, res) => {
   const departmentId = toInt(req.params.id);
   if (!Number.isInteger(departmentId)) return res.status(400).json({ message: "Invalid department" });
   const { error, v } = readTeam(req.body || {});
@@ -253,7 +240,7 @@ router.post("/departments/:id/teams", authenticateToken, manageOnly, async (req,
 });
 
 // PUT /api/teams/:id   { name, leaderId, subLeaderId?, memberIds?: [], isActive }
-router.put("/teams/:id", authenticateToken, manageOnly, async (req, res) => {
+router.put("/teams/:id", authenticateToken, requirePermission("team.manage"), async (req, res) => {
   const id = toInt(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: "Invalid team" });
   const { error, v } = readTeam(req.body || {});
@@ -318,7 +305,7 @@ const readBay = (b) => {
 };
 
 // POST /api/departments/:id/bays   { name, sortOrder?, isActive? }
-router.post("/departments/:id/bays", authenticateToken, manageOnly, async (req, res) => {
+router.post("/departments/:id/bays", authenticateToken, requirePermission("bay.manage"), async (req, res) => {
   const departmentId = toInt(req.params.id);
   if (!Number.isInteger(departmentId)) return res.status(400).json({ message: "Invalid department" });
   const { error, v } = readBay(req.body || {});
@@ -345,7 +332,7 @@ router.post("/departments/:id/bays", authenticateToken, manageOnly, async (req, 
 });
 
 // PUT /api/bays/:id   { name, sortOrder?, isActive }
-router.put("/bays/:id", authenticateToken, manageOnly, async (req, res) => {
+router.put("/bays/:id", authenticateToken, requirePermission("bay.manage"), async (req, res) => {
   const id = toInt(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: "Invalid bay" });
   const { error, v } = readBay(req.body || {});

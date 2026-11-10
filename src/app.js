@@ -24,6 +24,19 @@ const inventoryfull= require("./routes/inventoryfull");
 const customer_approval= require("./routes/customer_approval");
 const internal_inspection= require("./routes/internal_inspection");
 const job_activation= require("./routes/job_activation");
+const extra_scope= require("./routes/extra_scope");
+const team_inspection= require("./routes/team_inspection");
+const team_review= require("./routes/team_review");
+const dept_transfer= require("./routes/dept_transfer");
+const job_end= require("./routes/job_end");
+const handover_check= require("./routes/handover_check");
+const delivery_review= require("./routes/delivery_review");
+const free_inspection= require("./routes/free_inspection");
+const invoice= require("./routes/invoice");
+const settings= require("./routes/settings");
+const permissions= require("./routes/permissions");
+const push= require("./routes/push");
+const job_check= require("./routes/job_check");
 
 
 require('dotenv').config();
@@ -115,6 +128,19 @@ app.use("/inventoryfull", inventoryfull);
 app.use("/customer_approval", customer_approval); 
 app.use("/internal_inspection", internal_inspection); 
 app.use("/job_activation", job_activation); 
+app.use("/extra-scope", extra_scope); 
+app.use("/team_inspection", team_inspection); 
+app.use("/team_review", team_review); 
+app.use("/dept_transfer", dept_transfer); 
+app.use("/job_end", job_end); 
+app.use("/handover_check", handover_check); 
+app.use("/delivery_review", delivery_review); 
+app.use("/free_inspection", free_inspection); 
+app.use("/invoice", invoice); 
+app.use("/settings", settings); 
+app.use("/permissions", permissions); 
+app.use("/push", push); 
+app.use("/job_check", job_check); 
 
 
 

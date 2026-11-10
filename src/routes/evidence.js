@@ -80,7 +80,14 @@ router.get("/evidence-department/:name", authenticateToken, async (req, res) => 
               COALESCE(has_spare_parts, false) AS "hasSpareParts", spare_parts_stage_no AS "spareStageNo",
               COALESCE(has_customer_approval, false) AS "hasCustomerApproval", customer_approval_stage_no AS "approvalStageNo",
               COALESCE(has_internal_inspection, false) AS "hasInternalInspection", internal_inspection_stage_no AS "internalStageNo",
-              COALESCE(has_job_activation, false) AS "hasJobActivation", job_activation_stage_no AS "activationStageNo"
+              COALESCE(has_job_activation, false) AS "hasJobActivation", job_activation_stage_no AS "activationStageNo",
+              COALESCE(has_team_inspection, false) AS "hasTeamInspection", team_inspection_stage_no AS "teamInspectionStageNo",
+              COALESCE(has_team_review, false) AS "hasTeamReview", team_review_stage_no AS "teamReviewStageNo",
+              COALESCE(has_dept_transfer, false) AS "hasDeptTransfer", dept_transfer_stage_no AS "deptTransferStageNo",
+              COALESCE(has_job_end, false) AS "hasJobEnd", job_end_stage_no AS "jobEndStageNo",
+              COALESCE(has_handover_check, false) AS "hasHandoverCheck", handover_check_stage_no AS "handoverCheckStageNo",
+              COALESCE(has_delivery_review, false) AS "hasDeliveryReview", delivery_review_stage_no AS "deliveryReviewStageNo",
+              COALESCE(has_free_inspection, false) AS "hasFreeInspection", free_inspection_stage_no AS "freeInspectionStageNo"
        FROM department WHERE lower(name) = lower($1) AND is_active`,
       [name]
     );
@@ -503,9 +510,9 @@ async function smsEvidenceLink(req, jobId, phoneOverride = null) {
     await pool.query("UPDATE job_evidence SET link_token = $1, link_sent_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, jobId]);
     const base = String(process.env.PUBLIC_APP_URL || req.headers.origin || "").replace(/\/+$/, "");
     if (!base) return { sent: false, error: "PUBLIC_APP_URL is not set on the server" };
-    const text = `Vehicle evidence report for ${row.reg_no}: ${base}/evidence/${token}`;
-    let out = await sendSms(phoneOverride || row.phone, text);
-    if (!out.sent && !phoneOverride && row.main_phone && row.main_phone !== row.phone) out = await sendSms(row.main_phone, text); // fall back to the main number
+    const text = await renderSms("evidence", { regNo: row.reg_no, link: `${base}/evidence/${token}` });
+    let out = await sendSms(phoneOverride || row.phone, text, { kind: "evidence" });
+    if (!out.sent && !phoneOverride && row.main_phone && row.main_phone !== row.phone) out = await sendSms(row.main_phone, text, { kind: "evidence" }); // fall back to the main number
     if (out.sent) await pool.query("UPDATE job_evidence SET sms_sent_at = CURRENT_TIMESTAMP, sms_sent_to = $1 WHERE job_id = $2", [out.to, jobId]);
     return out;
   } catch (e) {
