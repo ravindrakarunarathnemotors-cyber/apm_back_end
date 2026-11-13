@@ -74,7 +74,7 @@ router.get("/jobs/:id/job-check", authenticateToken, async (req, res) => {
     const [items, saved, results, concern, options] = await Promise.all([
       pool.query(`SELECT id, group_name AS "groupName", name FROM job_check_item WHERE department_id = $1 AND is_active ORDER BY sort_order, id`, [job.departmentId]),
       pool.query(
-        `SELECT c.fully_checked AS "fullyChecked", c.signed_by_name AS "signedByName", c.signed_at AS "signedAt",
+        `SELECT c.fully_checked AS "fullyChecked", c.signed_by_name AS "signedByName", c.signed_at AS "signedAt", c.signature_image AS "signatureImage",
                 trim(concat(u.first_name, ' ', u.last_name)) AS "savedByName"
            FROM job_check c LEFT JOIN admin_user u ON u.id = c.saved_by WHERE c.job_id = $1`, [jobId]),
       pool.query("SELECT item_id FROM job_check_result WHERE job_id = $1 AND checked AND item_id IS NOT NULL", [jobId]),
@@ -116,6 +116,10 @@ router.put("/jobs/:id/job-check", authenticateToken, async (req, res) => {
   const wantsComplete = b.fullyChecked === true;
   const signedByName = clean(b.signedByName);
   if (signedByName && signedByName.length > 120) return res.status(400).json({ message: "The name is too long" });
+  const signatureImage = clean(b.signatureImage); // hand-drawn signature (PNG data URL), sent when the inspection is completed
+  if (signatureImage && (!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(signatureImage) || signatureImage.length > 400000)) {
+    return res.status(400).json({ message: "The signature image is not valid" });
+  }
 
   const userId = currentUserId(req);
   const admin = await isAdminUser(req);
@@ -128,7 +132,7 @@ router.put("/jobs/:id/job-check", authenticateToken, async (req, res) => {
     if (!job.hasJobCheck) { await client.query("ROLLBACK"); return res.status(409).json({ message: "The job inspection checklist is not used in this department" }); }
     if (job.status !== "IN_PROGRESS" || job.stageNo < job.checkStageNo) { await client.query("ROLLBACK"); return res.status(409).json({ message: "This job is not ready for the job inspection" }); }
 
-    const cur = await client.query("SELECT signed_at FROM job_check WHERE job_id = $1", [jobId]);
+    const cur = await client.query("SELECT signed_at, signature_image FROM job_check WHERE job_id = $1", [jobId]);
     if (cur.rows[0]?.signed_at && !admin) { await client.query("ROLLBACK"); return res.status(403).json({ message: "The inspection is signed. Only the administrator can change it." }); }
 
     const items = await client.query("SELECT id, group_name, name FROM job_check_item WHERE department_id = $1 AND is_active ORDER BY sort_order, id", [job.departmentId]);
@@ -137,17 +141,19 @@ router.put("/jobs/:id/job-check", authenticateToken, async (req, res) => {
 
     if (wantsComplete) {
       if (checked.size !== items.rowCount) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Tick every item of the checklist before marking it Fully Checked" }); }
-      if (!signedByName) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Enter the Team Leader name (signature)" }); }
+      if (!signedByName) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Select the Team Leader" }); }
+      if (!signatureImage && !cur.rows[0]?.signature_image) { await client.query("ROLLBACK"); return res.status(400).json({ message: "The Team Leader must draw the signature" }); }
     }
 
     await client.query(
-      `INSERT INTO job_check (job_id, fully_checked, signed_by_name, signed_by_user, signed_at, saved_by)
-       VALUES ($1, $2, $3, CASE WHEN $2::boolean THEN $4::int END, CASE WHEN $2::boolean THEN CURRENT_TIMESTAMP END, $4)
+      `INSERT INTO job_check (job_id, fully_checked, signed_by_name, signed_by_user, signed_at, signature_image, saved_by)
+       VALUES ($1, $2, $3, CASE WHEN $2::boolean THEN $4::int END, CASE WHEN $2::boolean THEN CURRENT_TIMESTAMP END, CASE WHEN $2::boolean THEN $5 END, $4)
        ON CONFLICT (job_id) DO UPDATE SET
          fully_checked = EXCLUDED.fully_checked, signed_by_name = EXCLUDED.signed_by_name,
          signed_by_user = EXCLUDED.signed_by_user, signed_at = EXCLUDED.signed_at,
+         signature_image = CASE WHEN EXCLUDED.fully_checked THEN COALESCE($5, job_check.signature_image) ELSE NULL END,
          saved_by = EXCLUDED.saved_by, updated_at = CURRENT_TIMESTAMP`,
-      [jobId, wantsComplete, signedByName, userId]
+      [jobId, wantsComplete, signedByName, userId, signatureImage]
     );
     await client.query("DELETE FROM job_check_result WHERE job_id = $1", [jobId]);
     for (const i of items.rows) {

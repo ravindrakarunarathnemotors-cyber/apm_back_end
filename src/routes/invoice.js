@@ -378,4 +378,7 @@ router.delete("/jobs/:id/payments/:pid", authenticateToken, (req, res) => withIn
  
 module.exports = router;
 module.exports.createInvoice = createInvoice;
+module.exports.replaceLines = replaceLines;
+module.exports.recalc = recalc;
+module.exports.rootJobId = rootJobId;
  

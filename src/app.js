@@ -37,6 +37,10 @@ const settings= require("./routes/settings");
 const permissions= require("./routes/permissions");
 const push= require("./routes/push");
 const job_check= require("./routes/job_check");
+const team_check= require("./routes/team_check");
+const drying_check= require("./routes/drying_check");
+const internal_check= require("./routes/internal_check");
+const wash_delivery= require("./routes/wash_delivery");
 
 
 require('dotenv').config();
@@ -141,6 +145,10 @@ app.use("/settings", settings);
 app.use("/permissions", permissions); 
 app.use("/push", push); 
 app.use("/job_check", job_check); 
+app.use("/team_check", team_check); 
+app.use("/drying_check", drying_check); 
+app.use("/internal_check", internal_check); 
+app.use("/wash_delivery", wash_delivery); 
 
 
 

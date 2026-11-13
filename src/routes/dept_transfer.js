@@ -1,30 +1,26 @@
+// "Transfer to other departments" stage (after "Review Team Inspection Sheet"):
+//   "Transfer to other departments" Yes / No (default No). Yes -> ONE department is selected from a dropdown.
+//   Yes -> a new linked job (same customer & vehicle) is created in that department; its own process starts at the complaint stage (5).
+// Mount (same prefix as the other stage routes):  app.use("/evidence", require("./routes/dept_transfer.routes"));
+// Needs create_dept_transfer.sql and express.json().
 const express = require("express");
-const authenticateToken = require("../middleware/authMiddleware");
-const pool = require("../config/db");
-const { formatPhoneNumber, getBrandingSetting, insertAdminlogs } = require("../models/userModels")
-const bcrypt = require("bcrypt");
-const dayjs = require('dayjs');
-const utc = require('dayjs/plugin/utc');
-const timezone = require('dayjs/plugin/timezone');
-const { customhookInvoice, sendProvisioningEmailPostmark, customhookQuotation } = require("../models/smstempmodels");
-const { Client } = require('ssh2');
-const CryptoJS = require('crypto-js');
-const axios = require('axios');
-const jwt = require("jsonwebtoken");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-const { randomBytes } = require("node:crypto");
-const S3Service = require('./s3Service');
-const { sendSms, toSriLankaNumber } = require("../services/sms.service"); 
-
-dayjs.extend(utc);
-dayjs.extend(timezone);
 const router = express.Router();
+// the file names differ between projects: the first one that exists is used
+function tryLoad(paths) {
+  for (const q of paths) {
+    try { return require(q); } catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes(`'${q}'`)) throw e; }
+  }
+  return null;
+}
+const pool = tryLoad(["../config/db", "../db"]);
+const authenticateToken = tryLoad(["../middleware/authMiddleware", "../middleware/authenticateToken"]);
+if (!pool || !authenticateToken) throw new Error("dept_transfer: the db / auth middleware path is wrong (check the two require lines at the top)");
+// Job number: the project's numbering helper when there is one (Settings > Numbering), otherwise the same JOB-00031 format the job creation uses
+const numbering = tryLoad(["./numbering.helper", "./numbering", "../helpers/numbering.helper", "../utils/numbering"]);
+const formatNo = numbering?.formatNo || (async (_db, kind, id) => `${kind === "job" ? "JOB-" : ""}${String(id).padStart(5, "0")}`);
 
- 
 const FIRST_DEPARTMENT_STAGE = 5;   // the new job starts at the complaint stage of its department
- 
+
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
   return Number.isInteger(n) ? n : null;
@@ -33,7 +29,7 @@ const toInt = (v) => {
   const n = Number(String(v ?? "").trim());
   return Number.isInteger(n) ? n : NaN;
 };
- 
+
 async function loadJob(db, jobId) {
   const r = await db.query(
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
@@ -44,21 +40,21 @@ async function loadJob(db, jobId) {
   return r.rows[0] || null;
 }
 const reached = (job) => job.status === "IN_PROGRESS" && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
- 
+
 async function state(db, job) {
   const [deps, done, head] = await Promise.all([
     db.query(`SELECT id, name FROM department WHERE is_active AND show_in_job_stage AND id <> $1 ORDER BY sort_order, id`, [job.departmentId]),
     db.query(`SELECT t.department_id AS "departmentId", d.name AS "departmentName", t.transferred, t.new_job_id AS "newJobId", nj.job_no AS "newJobNo"
               FROM job_dept_transfer t JOIN department d ON d.id = t.department_id LEFT JOIN job nj ON nj.id = t.new_job_id WHERE t.job_id = $1`, [job.id]),
-    db.query(`SELECT completed_at AS "completedAt" FROM job_dept_transfer_header WHERE job_id = $1`, [job.id]),
+    db.query(`SELECT completed_at AS "completedAt", remark FROM job_dept_transfer_header WHERE job_id = $1`, [job.id]),
   ]);
   return {
     departments: deps.rows,       // the departments the job can be transferred to (one is selected)
     saved: done.rows,             // the transfer already made
-    header: head.rows[0] || { completedAt: null },
+    header: head.rows[0] || { completedAt: null, remark: null },
   };
 }
- 
+
 // GET /jobs/:id/dept-transfer
 router.get("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -71,8 +67,8 @@ router.get("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
     return res.json({ job, ...st, reached: reached(job), canRecord: reached(job) && !st.header.completedAt });
   } catch (e) { console.error("load dept transfer:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
-// POST /jobs/:id/dept-transfer   { transfer: true|false, departmentId? }
+
+// POST /jobs/:id/dept-transfer   { transfer: true|false, departmentId?, remark? }   (remark = optional note, max 1000 characters)
 //   No  -> the stage completes without a transfer.
 //   Yes -> exactly one department is selected; a linked job is created there and the stage completes.
 router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
@@ -81,6 +77,8 @@ router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
   if (typeof req.body?.transfer !== "boolean") return res.status(400).json({ message: "Select Yes or No" });
   const transfer = req.body.transfer;
   const departmentId = toInt(req.body?.departmentId);
+  const remark = String(req.body?.remark ?? "").trim() || null;
+  if (remark && remark.length > 1000) return res.status(400).json({ message: "The remark is too long (max 1000 characters)" });
   if (transfer && !Number.isInteger(departmentId)) return res.status(400).json({ message: "Select the department" });
   const client = await pool.connect();
   try {
@@ -92,7 +90,7 @@ router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
     await client.query("INSERT INTO job_dept_transfer_header (job_id) VALUES ($1) ON CONFLICT (job_id) DO NOTHING", [jobId]);
     const h = await client.query("SELECT completed_at FROM job_dept_transfer_header WHERE job_id = $1 FOR UPDATE", [jobId]);
     if (h.rows[0].completed_at) { await client.query("ROLLBACK"); return res.status(409).json({ message: "This stage is already completed" }); }
- 
+
     const created = [];
     if (transfer) {
       const st = await state(client, job);
@@ -100,7 +98,7 @@ router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
       // the related department's process: a new linked job for the same customer & vehicle, department selected, starting at the complaint stage
       const seq = await client.query("SELECT nextval(pg_get_serial_sequence('job', 'id')) AS id");
       const newJobId = Number(seq.rows[0].id);
-      const newJobNo = `JOB-${String(newJobId).padStart(5, "0")}`;
+      const newJobNo = await formatNo(pool, "job", newJobId);
       await client.query(
         `INSERT INTO job
            (id, job_no, customer_id, vehicle_id, consultant_id, reg_no, year_of_manufacture, mileage_km,
@@ -123,8 +121,8 @@ router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
       await client.query("INSERT INTO job_dept_transfer (job_id, department_id, transferred, new_job_id, decided_by) VALUES ($1, $2, true, $3, $4) ON CONFLICT (job_id, department_id) DO UPDATE SET transferred = true, new_job_id = EXCLUDED.new_job_id, decided_by = EXCLUDED.decided_by, decided_at = CURRENT_TIMESTAMP", [jobId, departmentId, newJobId, uid]);
       created.push({ departmentId, jobId: newJobId, jobNo: newJobNo });
     }
- 
-    await client.query("UPDATE job_dept_transfer_header SET completed_at = CURRENT_TIMESTAMP, completed_by = $2 WHERE job_id = $1", [jobId, uid]);
+
+    await client.query("UPDATE job_dept_transfer_header SET completed_at = CURRENT_TIMESTAMP, completed_by = $2, remark = $3 WHERE job_id = $1", [jobId, uid, remark]);
     let stageNo = job.stageNo;
     if (job.stageNo === job.thisStageNo) {
       const next = job.thisStageNo + 1;
@@ -144,6 +142,5 @@ router.post("/jobs/:id/dept-transfer", authenticateToken, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
- 
+
 module.exports = router;
- 

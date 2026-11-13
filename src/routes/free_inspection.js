@@ -1,28 +1,20 @@
+// "Free Inspection Schedule" stage (after "Delivery Review").
+//   a. Explain why this is important (Done / Not yet), Customer willingness (Yes / Not now),
+//   Schedule (date, time, department) when Yes, Department Head signature  -> GREAT JOB.
+// Mount (same prefix as the other stage routes):  app.use("/evidence", require("./routes/free_inspection.routes"));
+// Needs create_free_inspection.sql and express.json() (the signature is a PNG data URL: e.g. express.json({ limit: "2mb" })).
 const express = require("express");
-const authenticateToken = require("../middleware/authMiddleware");
-const pool = require("../config/db");
-const { formatPhoneNumber, getBrandingSetting, insertAdminlogs } = require("../models/userModels")
-const bcrypt = require("bcrypt");
-const dayjs = require('dayjs');
-const utc = require('dayjs/plugin/utc');
-const timezone = require('dayjs/plugin/timezone');
-const { customhookInvoice, sendProvisioningEmailPostmark, customhookQuotation } = require("../models/smstempmodels");
-const { Client } = require('ssh2');
-const CryptoJS = require('crypto-js');
-const axios = require('axios');
-const jwt = require("jsonwebtoken");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-const { randomBytes } = require("node:crypto");
-const S3Service = require('./s3Service');
-const { sendSms, toSriLankaNumber } = require("../services/sms.service"); 
-
-dayjs.extend(utc);
-dayjs.extend(timezone);
-
-
 const router = express.Router();
+// the file names differ between projects: the first one that exists is used
+function tryLoad(paths) {
+  for (const q of paths) {
+    try { return require(q); } catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes(`'${q}'`)) throw e; }
+  }
+  return null;
+}
+const pool = tryLoad(["../config/db", "../db"]);
+const authenticateToken = tryLoad(["../middleware/authMiddleware", "../middleware/authenticateToken"]);
+if (!pool || !authenticateToken) throw new Error("free_inspection: the db / auth middleware path is wrong (check the two require lines at the top)");
 
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
@@ -60,6 +52,30 @@ async function header(db, jobId) {
      FROM job_free_inspection f LEFT JOIN department d ON d.id = f.sched_department_id WHERE f.job_id = $1`, [jobId]);
   return h.rows[0] || { explained: null, willing: null, schedDate: null, schedTime: null, schedDepartmentId: null, schedDepartmentName: null, signedByName: null, signatureImage: null, completedAt: null };
 }
+
+// GET /free-inspections   -> the free inspections that customers agreed to (willing = YES) and that are scheduled from today on.
+//   Shown on the Job Dashboard. ?days=60 (how far ahead, default 60, max 365)
+router.get("/free-inspections", authenticateToken, async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days) || 60));
+  try {
+    const r = await pool.query(
+      `SELECT f.job_id AS "jobId", j.job_no AS "jobNo", j.reg_no AS "regNo",
+              c.customer_name AS "customerName", c.contact_number AS "contactNumber",
+              bd.name AS "fromDepartment", sd.name AS "scheduleDepartment",
+              to_char(f.sched_date, 'YYYY-MM-DD') AS "schedDate", to_char(f.sched_time, 'HH24:MI') AS "schedTime",
+              f.signed_by_name AS "signedByName", f.completed_at AS "bookedAt"
+         FROM job_free_inspection f
+         JOIN job j ON j.id = f.job_id
+         JOIN customer c ON c.id = j.customer_id
+         LEFT JOIN department bd ON bd.id = j.department_id
+         LEFT JOIN department sd ON sd.id = f.sched_department_id
+        WHERE f.willing = 'YES' AND f.completed_at IS NOT NULL AND f.sched_date IS NOT NULL
+          AND f.sched_date >= CURRENT_DATE AND f.sched_date <= CURRENT_DATE + $1::int
+        ORDER BY f.sched_date, f.sched_time, f.job_id
+        LIMIT 200`, [days]);
+    return res.json(r.rows);
+  } catch (e) { console.error("list free inspections:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+});
 
 // GET /jobs/:id/free-inspection
 router.get("/jobs/:id/free-inspection", authenticateToken, async (req, res) => {

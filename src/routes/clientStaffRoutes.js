@@ -24,7 +24,6 @@ dayjs.extend(timezone);
 const router = express.Router();
 
 
- 
 const ADMIN_ROLE_ID = 1;
 const PASSWORD_MIN = 8;
 const NAME_RE = /^[\p{L}\s.'-]{1,60}$/u;          // letters of any language, spaces, . ' -   (K.M. Perera, De-Silva, D'Souza)
@@ -1046,6 +1045,13 @@ const JOB_COLUMNS = `SELECT
                        WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_job_check, false) AND j.current_stage_no = d.job_check_stage_no THEN 'Vehicle Job Inspection'
+                       WHEN COALESCE(d.has_team_check, false) AND j.current_stage_no = d.team_check_stage_no THEN 'Team Self-Inspection'
+                       WHEN COALESCE(d.has_drying_check, false) AND j.current_stage_no = d.drying_check_stage_no THEN 'Drying Area'
+                       WHEN COALESCE(d.has_internal_check, false) AND j.current_stage_no = d.internal_check_stage_no THEN 'Internal Inspection 2'
+                       WHEN COALESCE(d.has_dept_transfer, false) AND j.current_stage_no = d.dept_transfer_stage_no THEN 'Transfer to Other Departments'
+                       WHEN COALESCE(d.has_handover_check, false) AND j.current_stage_no = d.handover_check_stage_no AND lower(d.name) = 'wash' THEN 'Delivery Arrangement'
+                       WHEN COALESCE(d.has_wash_delivery, false) AND j.current_stage_no = d.wash_delivery_stage_no THEN 'Delivery Review'
+                       WHEN COALESCE(d.has_free_inspection, false) AND j.current_stage_no = d.free_inspection_stage_no AND lower(d.name) = 'wash' THEN 'Free Inspection Schedule'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
                        WHEN COALESCE(d.has_customer_approval, false) AND j.current_stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
                        WHEN COALESCE(d.has_internal_inspection, false) AND j.current_stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
@@ -1128,6 +1134,13 @@ router.get("/jobs/summary", authenticateToken, async (req, res) => {
                          COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                                        WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                                        WHEN COALESCE(d.has_job_check, false) AND j.current_stage_no = d.job_check_stage_no THEN 'Vehicle Job Inspection'
+                                       WHEN COALESCE(d.has_team_check, false) AND j.current_stage_no = d.team_check_stage_no THEN 'Team Self-Inspection'
+                                       WHEN COALESCE(d.has_drying_check, false) AND j.current_stage_no = d.drying_check_stage_no THEN 'Drying Area'
+                                       WHEN COALESCE(d.has_internal_check, false) AND j.current_stage_no = d.internal_check_stage_no THEN 'Internal Inspection 2'
+                                       WHEN COALESCE(d.has_dept_transfer, false) AND j.current_stage_no = d.dept_transfer_stage_no THEN 'Transfer to Other Departments'
+                                       WHEN COALESCE(d.has_handover_check, false) AND j.current_stage_no = d.handover_check_stage_no AND lower(d.name) = 'wash' THEN 'Delivery Arrangement'
+                                       WHEN COALESCE(d.has_wash_delivery, false) AND j.current_stage_no = d.wash_delivery_stage_no THEN 'Delivery Review'
+                                       WHEN COALESCE(d.has_free_inspection, false) AND j.current_stage_no = d.free_inspection_stage_no AND lower(d.name) = 'wash' THEN 'Free Inspection Schedule'
                                        WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
                                        WHEN COALESCE((to_jsonb(d)->>'has_customer_approval')::boolean, false) AND j.current_stage_no = (to_jsonb(d)->>'customer_approval_stage_no')::int THEN 'Customer Approval'
                                        WHEN COALESCE((to_jsonb(d)->>'has_internal_inspection')::boolean, false) AND j.current_stage_no = (to_jsonb(d)->>'internal_inspection_stage_no')::int THEN 'Internal Inspection - 1'
@@ -1319,6 +1332,13 @@ router.get("/jobs/:id", authenticateToken, async (req, res) => {
          COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND j.current_stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND j.current_stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_job_check, false) AND j.current_stage_no = d.job_check_stage_no THEN 'Vehicle Job Inspection'
+                       WHEN COALESCE(d.has_team_check, false) AND j.current_stage_no = d.team_check_stage_no THEN 'Team Self-Inspection'
+                       WHEN COALESCE(d.has_drying_check, false) AND j.current_stage_no = d.drying_check_stage_no THEN 'Drying Area'
+                       WHEN COALESCE(d.has_internal_check, false) AND j.current_stage_no = d.internal_check_stage_no THEN 'Internal Inspection 2'
+                       WHEN COALESCE(d.has_dept_transfer, false) AND j.current_stage_no = d.dept_transfer_stage_no THEN 'Transfer to Other Departments'
+                       WHEN COALESCE(d.has_handover_check, false) AND j.current_stage_no = d.handover_check_stage_no AND lower(d.name) = 'wash' THEN 'Delivery Arrangement'
+                       WHEN COALESCE(d.has_wash_delivery, false) AND j.current_stage_no = d.wash_delivery_stage_no THEN 'Delivery Review'
+                       WHEN COALESCE(d.has_free_inspection, false) AND j.current_stage_no = d.free_inspection_stage_no AND lower(d.name) = 'wash' THEN 'Free Inspection Schedule'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND j.current_stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
                        WHEN COALESCE(d.has_customer_approval, false) AND j.current_stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
                        WHEN COALESCE(d.has_internal_inspection, false) AND j.current_stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
@@ -1350,6 +1370,13 @@ router.get("/jobs/:id", authenticateToken, async (req, res) => {
          COALESCE(CASE WHEN COALESCE(d.has_spare_parts, false) AND s.stage_no = d.spare_parts_stage_no THEN 'Spare Part Review & Order'
                        WHEN COALESCE(d.has_job_inspection, false) AND s.stage_no = d.job_inspection_stage_no THEN 'Vehicle Job Inspection'
                        WHEN COALESCE(d.has_job_check, false) AND s.stage_no = d.job_check_stage_no THEN 'Vehicle Job Inspection'
+                       WHEN COALESCE(d.has_team_check, false) AND s.stage_no = d.team_check_stage_no THEN 'Team Self-Inspection'
+                       WHEN COALESCE(d.has_drying_check, false) AND s.stage_no = d.drying_check_stage_no THEN 'Drying Area'
+                       WHEN COALESCE(d.has_internal_check, false) AND s.stage_no = d.internal_check_stage_no THEN 'Internal Inspection 2'
+                       WHEN COALESCE(d.has_dept_transfer, false) AND s.stage_no = d.dept_transfer_stage_no THEN 'Transfer to Other Departments'
+                       WHEN COALESCE(d.has_handover_check, false) AND s.stage_no = d.handover_check_stage_no AND lower(d.name) = 'wash' THEN 'Delivery Arrangement'
+                       WHEN COALESCE(d.has_wash_delivery, false) AND s.stage_no = d.wash_delivery_stage_no THEN 'Delivery Review'
+                       WHEN COALESCE(d.has_free_inspection, false) AND s.stage_no = d.free_inspection_stage_no AND lower(d.name) = 'wash' THEN 'Free Inspection Schedule'
                        WHEN COALESCE(d.has_vehicle_evidence, false) AND s.stage_no = d.evidence_stage_no THEN 'Vehicle Evidence of Damages'
                        WHEN COALESCE(d.has_customer_approval, false) AND s.stage_no = d.customer_approval_stage_no THEN 'Customer Approval'
                        WHEN COALESCE(d.has_internal_inspection, false) AND s.stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'

@@ -41,6 +41,7 @@ const toPrice = (v) => {
 };
 
 const { requirePermission } = require("./permissions"); // action permission: repairtype.manage
+const { syncWashInvoice } = require("./wash_invoice.helper"); // Wash: the invoice is created when the job starts
 
 async function canManageLists(db, userId) {
   if (!userId) return false;
@@ -320,6 +321,8 @@ router.post("/jobs/:id/complaint", authenticateToken, async (req, res) => {
     }
 
     await client.query("COMMIT");
+    // Wash: the invoice is created when the job is started and the wash types are added to it (never breaks the save)
+    await syncWashInvoice(jobId, userId).catch((e) => console.error("wash invoice sync:", e.message));
     return res.json({
       message: "Complaint saved",
       currentStageNo,
