@@ -12,7 +12,47 @@ dayjs.extend(timezone);
 
 
 const router = express.Router();
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});
+pool.query("ALTER TABLE job_spare_quote ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});   // lines of the Extra Job Scope carry extra_scope_id; this stage shows only its own lines
 
+// ---- notification for the Inventory & Spare Parts team ----
+// Everybody whose role has the "Inventory & Spare Parts" menu privilege gets a bell notification + a push (push.routes.js -> sendPushToUser).
+// The menu row is found by its name / route (contains "inventory"); to pin it down put the menu id(s) in .env:  INVENTORY_MENU_IDS=57,58
+let sendPushToUser = null;
+{
+  // the push file is found by name (push.routes / push / pushRoutes ...) in this folder, then any push*.js here that exports sendPushToUser
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const names = ["push.routes", "push", "pushRoutes", "push.route", "push_routes", "push.js", "notification.routes", "notifications"];
+  let found = names.map((n) => `./${n}`);
+  try { found = found.concat(fs.readdirSync(__dirname).filter((x) => /^push.*\.js$/i.test(x) && x !== path.basename(__filename)).map((x) => `./${x}`)); } catch (_) { /* ignore */ }
+  for (const p of found) {
+    try { const m = require(p); if (typeof m?.sendPushToUser === "function") { sendPushToUser = m.sendPushToUser; break; } }
+    catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes(p.replace("./", ""))) console.error(`push file ${p}:`, e.message); }
+  }
+}
+async function notifyInventory(job, nParts, nQuotes, exceptUserId) {
+  try {
+    if (!sendPushToUser) { console.error("inventory notification: the push file (the one that exports sendPushToUser) was not found in this folder (no notification sent). Put its file name in the require list at the top of spare_parts.routes.js."); return; }
+    const envIds = String(process.env.INVENTORY_MENU_IDS || "").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x) && Number(x) > 0).map(Number); // empty .env value = look the menu up by name
+    const menu = envIds.length
+      ? await pool.query("SELECT id, route FROM admin_uimenudata WHERE id = ANY($1::int[])", [envIds])
+      : await pool.query(`SELECT id, route FROM admin_uimenudata WHERE status <> 'permission' AND (name ILIKE '%inventory%' OR route ILIKE '%inventory%') ORDER BY (route IS NULL OR route IN ('#', '')), id`);
+    if (menu.rowCount === 0) { console.error("inventory notification: no menu row found for Inventory & Spare Parts (set INVENTORY_MENU_IDS in .env)"); return; }
+    const ids = menu.rows.map((m) => m.id);
+    const base = process.env.INVENTORY_PUSH_URL || menu.rows.find((m) => m.route && m.route !== "#")?.route || "/";
+    const url = `${base}${base.includes("?") ? "&" : "?"}tab=jobcards&job=${job.id}`; // opens Inventory -> Job Cards -> Spare part orders with this job expanded
+    const users = await pool.query(
+      `SELECT DISTINCT u.id FROM admin_user u JOIN admin_role r ON r.id = u.role_id
+        WHERE r.privileges::text[] && $1::text[] AND COALESCE(r.status, 'active') = 'active'`, [ids.map(String)]); // privileges is a text[] column
+    console.log(`inventory notification: job ${job.jobNo} -> ${users.rowCount} user(s) with the Inventory privilege (menu ${ids.join(",")}), url ${url}`);
+    const what = [nParts > 0 ? `${nParts} part${nParts === 1 ? "" : "s"}` : "", nQuotes > 0 ? `${nQuotes} quotation request${nQuotes === 1 ? "" : "s"}` : ""].filter(Boolean).join(" + ") || "spare parts";
+    // everybody with the Inventory & Spare Parts privilege gets it (the user who pressed Upload too, if he has the privilege)
+    for (const u of users.rows) {
+      await sendPushToUser(u.id, { title: "Spare part request", body: `${job.jobNo} · ${job.regNo}: ${what} (${job.departmentName || "-"})`, url });
+    }
+  } catch (e) { console.error("inventory notification:", e.message); }
+}
 
 const clean = (v) => {
   if (v === undefined || v === null) return null;
@@ -34,7 +74,7 @@ const currentUserId = (req) => {
   return Number.isInteger(n) ? n : null;
 };
 const STOCK = ["IN_STOCK", "OUT_OF_STOCK", "UNKNOWN"];
- 
+
 async function loadJob(db, jobId) {
   const r = await db.query(
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
@@ -49,26 +89,30 @@ async function loadJob(db, jobId) {
 // (the stage right before the spare parts stage) is open. Signing the inspection completes the spare parts stage as well.
 const reached = (job) => job.status === "IN_PROGRESS" && job.hasSpareParts
   && (job.stageNo >= job.spareStageNo || (job.hasJobInspection && job.stageNo === job.inspectionStageNo && job.inspectionStageNo + 1 === job.spareStageNo));
- 
+
 const ITEM_SELECT = `SELECT id, part_id AS "partId", name, brand, quality, qty, unit_price::float AS "unitPrice", price_source AS "priceSource",
                             stock_status AS "stockStatus", note, COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part`;
 const QUOTE_SELECT = `SELECT id, photo_url AS "photoUrl", description, status, quoted_price::float AS "quotedPrice", quoted_note AS "quotedNote", quoted_at AS "quotedAt" FROM job_spare_quote`;
- 
+
 async function options(db) {
   const r = await db.query("SELECT kind, name FROM spare_part_option WHERE is_active ORDER BY kind, sort_order, id");
   return { brands: r.rows.filter((x) => x.kind === "BRAND").map((x) => x.name), qualities: r.rows.filter((x) => x.kind === "QUALITY").map((x) => x.name) };
 }
 async function listState(db, jobId) {
   const [items, quotes, head] = await Promise.all([
-    db.query(`${ITEM_SELECT} WHERE job_id = $1 ORDER BY id`, [jobId]),
-    db.query(`${QUOTE_SELECT} WHERE job_id = $1 ORDER BY id`, [jobId]),
-    db.query(`SELECT no_parts_needed AS "noParts", link_token AS "linkToken", link_sent_at AS "linkSentAt", logistics_updated_at AS "logisticsUpdatedAt", completed_at AS "completedAt" FROM job_spare_parts WHERE job_id = $1`, [jobId]),
+    db.query(`${ITEM_SELECT} WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]),
+    db.query(`${QUOTE_SELECT} WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]),
+    db.query(`SELECT no_parts_needed AS "noParts", link_token AS "linkToken", link_sent_at AS "linkSentAt", logistics_updated_at AS "logisticsUpdatedAt", completed_at AS "completedAt", updated_at AS "updatedAt" FROM job_spare_parts WHERE job_id = $1`, [jobId]),
   ]);
   const total = items.rows.filter((r) => !r.warrantyClaim).reduce((s, r) => s + r.qty * r.unitPrice, 0)
     + quotes.rows.filter((q) => q.quotedPrice != null).reduce((s, q) => s + q.quotedPrice, 0);
-  return { items: items.rows, quotes: quotes.rows, header: head.rows[0] || { noParts: false, linkToken: null, linkSentAt: null, logisticsUpdatedAt: null, completedAt: null }, totalSparePartsValue: Math.round(total * 100) / 100 };
+  const header = head.rows[0] || { noParts: false, linkToken: null, linkSentAt: null, logisticsUpdatedAt: null, completedAt: null, updatedAt: null };
+  // "Upload to ERP System" is needed only when there is something to send: never uploaded, new quotation requests, or anything changed after the last upload
+  const hasContent = items.rows.length > 0 || quotes.rows.length > 0;
+  header.needsUpload = hasContent && (!header.linkSentAt || quotes.rows.some((q) => q.status === "REQUESTED") || (header.updatedAt && new Date(header.updatedAt) > new Date(header.linkSentAt)));
+  return { items: items.rows, quotes: quotes.rows, header, totalSparePartsValue: Math.round(total * 100) / 100 };
 }
- 
+
 // "Root cause / Labour work list" shown from the previous related stage (Job Inspection for Mechanical, else the complaint)
 async function previousStage(db, jobId) {
   const [items, repairs, concerns] = await Promise.all([
@@ -82,7 +126,7 @@ async function previousStage(db, jobId) {
     complaint: concerns.rows[0]?.complaint || "", concerns: concerns.rows.filter((r) => r.name).map((r) => ({ level: r.level, name: r.name })),
   };
 }
- 
+
 // GET /jobs/:id/spare-parts   (any logged-in user can read it: other departments, Logistic & Stock ...)
 router.get("/jobs/:id/spare-parts", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -98,7 +142,7 @@ router.get("/jobs/:id/spare-parts", authenticateToken, async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   }
 });
- 
+
 // ---- guard for the writing routes ----
 async function guard(req, res) {
   const jobId = toInt(req.params.id);
@@ -109,10 +153,11 @@ async function guard(req, res) {
   const h = await pool.query("SELECT completed_at FROM job_spare_parts WHERE job_id = $1", [jobId]);
   if (h.rows[0]?.completed_at) { res.status(409).json({ message: "The spare parts stage is already completed" }); return null; }
   await pool.query("INSERT INTO job_spare_parts (job_id, saved_by) VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING", [jobId, currentUserId(req)]);
+  await pool.query("UPDATE job_spare_parts SET updated_at = CURRENT_TIMESTAMP WHERE job_id = $1", [jobId]); // every change marks the list as "not uploaded yet"
   return { job, jobId };
 }
 const reply = async (res, jobId, status = 200) => res.status(status).json(await listState(pool, jobId));
- 
+
 // POST /jobs/:id/spare-parts/items   { partId }  or  { name, brand, quality, qty, unitPrice }
 router.post("/jobs/:id/spare-parts/items", authenticateToken, async (req, res) => {
   try {
@@ -140,7 +185,7 @@ router.post("/jobs/:id/spare-parts/items", authenticateToken, async (req, res) =
     return reply(res, g.jobId, 201);
   } catch (e) { console.error("add spare part:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PUT /jobs/:id/spare-parts/items/:itemId   { qty?, unitPrice?, brand?, name? }   -> "Update spare parts price manually"
 router.put("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -165,7 +210,7 @@ router.put("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req,
     return reply(res, g.jobId);
   } catch (e) { console.error("update spare part:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PATCH /jobs/:id/spare-parts/items/:itemId/warranty   { claim }   -> mark / unmark a spare part as a warranty claim (not charged)
 router.patch("/jobs/:id/spare-parts/items/:itemId/warranty", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -177,7 +222,7 @@ router.patch("/jobs/:id/spare-parts/items/:itemId/warranty", authenticateToken, 
     return reply(res, g.jobId);
   } catch (e) { console.error("spare part warranty:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 router.delete("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
@@ -194,7 +239,7 @@ router.delete("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (r
     return reply(res, g.jobId);
   } catch (e) { console.error("remove spare part:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // Third-party quotation requests: { photoUrl?, description }
 router.post("/jobs/:id/spare-parts/quotes", authenticateToken, async (req, res) => {
   try {
@@ -210,12 +255,13 @@ router.delete("/jobs/:id/spare-parts/quotes/:qid", authenticateToken, async (req
   if (!Number.isInteger(qid)) return res.status(400).json({ message: "Invalid item" });
   try {
     const g = await guard(req, res); if (!g) return;
-    await pool.query("DELETE FROM job_spare_quote WHERE id = $1 AND job_id = $2 AND status = 'REQUESTED'", [qid, g.jobId]);
+    // can be removed at any stage (requested / already sent to Logistic & Stock / quoted): it also leaves their list
+    await pool.query("DELETE FROM job_spare_quote WHERE id = $1 AND job_id = $2", [qid, g.jobId]);
     return reply(res, g.jobId);
   } catch (e) { console.error("remove quote:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
-// POST /jobs/:id/spare-parts/link -> uploads the requirement + quotation requests to the ERP (status SENT) and creates the link for the Logistic & Stock department
+
+// POST /jobs/:id/spare-parts/link -> sends the requirement + quotation requests to Inventory & Spare Parts (they appear in Inventory -> Job Cards -> Spare part orders). No SMS is sent.
 router.post("/jobs/:id/spare-parts/link", authenticateToken, async (req, res) => {
   try {
     const g = await guard(req, res); if (!g) return;
@@ -223,16 +269,13 @@ router.post("/jobs/:id/spare-parts/link", authenticateToken, async (req, res) =>
     const token = cur.rows[0]?.link_token || randomBytes(24).toString("hex");
     await pool.query("UPDATE job_spare_parts SET link_token = $1, link_sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, g.jobId]);
     await pool.query("UPDATE job_spare_quote SET status = 'SENT' WHERE job_id = $1 AND status = 'REQUESTED'", [g.jobId]);
-    let sms = null;
-    const base = String(process.env.PUBLIC_APP_URL || req.headers.origin || "").replace(/\/+$/, "");
-    const logi = await getLogisticsNumber();
-    if (logi && base) {
-      sms = await sendSms(logi, await renderSms("spareRequest", { regNo: g.job.regNo, jobNo: g.job.jobNo, link: `${base}/spare-parts/${token}` }), { kind: "spareRequest" });
-    }
-    return res.json({ token, path: `/spare-parts/${token}`, sms, ...(await listState(pool, g.jobId)) });
+    const st = await listState(pool, g.jobId);
+    console.log(`spare parts uploaded: job ${g.job.jobNo} (${st.items.length} parts, ${st.quotes.length} quotation requests)`);
+    notifyInventory(g.job, st.items?.length || 0, (st.quotes || []).filter((q) => q.status === "SENT").length, currentUserId(req)); // fire and forget
+    return res.json({ token, path: `/spare-parts/${token}`, sms: null, ...st });
   } catch (e) { console.error("spare parts link:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PUT /jobs/:id/spare-parts   { noParts }
 router.put("/jobs/:id/spare-parts", authenticateToken, async (req, res) => {
   try {
@@ -244,7 +287,7 @@ router.put("/jobs/:id/spare-parts", authenticateToken, async (req, res) => {
     return reply(res, g.jobId);
   } catch (e) { console.error("spare parts header:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // POST /jobs/:id/spare-parts/complete -> the stage is finished, the job moves on
 router.post("/jobs/:id/spare-parts/complete", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -259,8 +302,15 @@ router.post("/jobs/:id/spare-parts/complete", authenticateToken, async (req, res
     await client.query("INSERT INTO job_spare_parts (job_id, saved_by) VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING", [jobId, currentUserId(req)]);
     const h = await client.query("SELECT no_parts_needed, completed_at FROM job_spare_parts WHERE job_id = $1 FOR UPDATE", [jobId]);
     if (h.rows[0].completed_at) { await client.query("ROLLBACK"); return res.status(409).json({ message: "Already completed" }); }
-    const n = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1", [jobId]);
+    const n = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL", [jobId]);
     if (n.rows[0].n === 0 && !h.rows[0].no_parts_needed) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Add the spare parts, or tick 'No spare parts needed'" }); }
+      // the parts / quotation requests must be uploaded to Inventory & Spare Parts first
+      if (n.rows[0].n > 0 || (await client.query("SELECT 1 FROM job_spare_quote WHERE job_id = $1 AND extra_scope_id IS NULL LIMIT 1", [jobId])).rowCount > 0) {
+        const up = await client.query(
+          `SELECT (SELECT link_sent_at FROM job_spare_parts WHERE job_id = $1) IS NOT NULL AS sent,
+                  EXISTS (SELECT 1 FROM job_spare_quote WHERE job_id = $1 AND status = 'REQUESTED' AND extra_scope_id IS NULL) AS "newQuotes"`, [jobId]);
+        if (!up.rows[0].sent || up.rows[0].newQuotes) { await client.query("ROLLBACK"); return res.status(409).json({ message: "First upload to Inventory: press \"Upload to ERP System\" in the spare parts section, then complete the inspection." }); }
+      }
     await client.query("UPDATE job_spare_parts SET completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $1", [jobId]);
     let stageNo = job.stageNo;
     if (job.stageNo === job.spareStageNo) {
@@ -279,7 +329,7 @@ router.post("/jobs/:id/spare-parts/complete", authenticateToken, async (req, res
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
- 
+
 /* ===================== spare parts master (catalog) ===================== */
 // GET /spare-parts/catalog?q=&quality=&all=1
 router.get("/spare-parts/catalog", authenticateToken, async (req, res) => {
@@ -331,7 +381,7 @@ router.post("/spare-parts/options", authenticateToken, async (req, res) => {
     return res.status(201).json(await options(pool));
   } catch (e) { console.error("add option:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 /* ===================== public page of the Logistic & Stock department ===================== */
 // GET /public/spare-parts/:token   (NO login - the long random token is the key; no customer data)
 router.get("/public/spare-parts/:token", async (req, res) => {
@@ -378,6 +428,5 @@ router.put("/public/spare-parts/:token", async (req, res) => {
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
- 
+
 module.exports = router;
- 

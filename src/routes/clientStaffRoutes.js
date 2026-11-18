@@ -14,8 +14,9 @@ const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const { sendPushToUser } = require("./push");   // <- me line eka
+
 const S3Service = require('./s3Service');
+const { sendPushToUser } = require("./push");
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -387,16 +388,16 @@ router.post("/get-user-logs", authenticateToken, act(async (req, res) => {
   res.json({ logs: result.rows, totalLogs, totalPages: Math.ceil(totalLogs / limit), currentPage: page });
 }, { adminOnly: true }));
  
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
+
+
+
+
+
+
+
+
+
+
 // Helpers of the customer / job routes below (empty value -> null, so SQL "$n IS NULL" filters work).
 // The user-management routes above have their own uClean / uToInt on purpose: they must not share these.
 const clean = (v) => { const s = String(v ?? "").trim(); return s === "" ? null : s; };
@@ -405,7 +406,7 @@ const toInt = (v) => {
   const n = Number(v);
   return Number.isInteger(n) ? n : NaN;
 };
- 
+
 // The logged-in system user (admin_user.id) taken from the JWT set by authenticateToken.
 // Change "user_id" here if your token payload uses another key.
 const currentUserId = (req) => {
@@ -424,7 +425,7 @@ const APPROVAL = {
 };
  
 /* ----------------------------- helpers ----------------------------- */
- 
+
  
 // Referral codes: KAZ-XXXXXX (no 0 / O / 1 / I, so they are easy to read out over the phone)
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -478,6 +479,42 @@ function validateCustomer(b) {
    - customerId present  -> existing customer picked from the search box -> updated, no duplicate
    Customer + all vehicles are saved in ONE transaction.
 ------------------------------------------------------------------------------ */
+// Welcome SMS for a newly registered customer (SMS service: sendSms(to, text, { kind }) - same one the delivery OTP uses)
+let welcomeSms = null;
+for (const p of ["../services/sms.service", "./sms.service", "../sms.service"]) {
+  try { welcomeSms = require(p); break; } catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes(`'${p}'`)) throw e; }
+}
+const sendWelcomeSms = async (c) => {
+  try {
+    console.log("welcome sms: new customer", c.erpId, "->", c.phone);
+    if (!welcomeSms?.sendSms) { console.error("welcome sms: services/sms.service was not found"); return; }
+    if (!clean(c.phone)) return;
+    welcomeSms.setPool?.(pool); // so the SMS service can read its settings and write sms_log with THIS db pool (its own "../db" path may not exist)
+    const company = (await welcomeSms.getSmsSettings?.().catch(() => null))?.companyName || "KARUNARATHNE AUTO ZONE";
+    const first = String(c.name || "").trim().split(/\s+/)[0] || "Customer";
+    const text = `Dear ${first}, welcome to ${company}! Your customer ID is ${c.erpId}. Thank you for choosing us, we look forward to taking care of your vehicle.`;
+    const out = await welcomeSms.sendSms(c.phone, text, { kind: "welcome" });
+    if (out?.sent) console.log("welcome sms sent to", out.to); else console.error("welcome sms not sent:", out?.error || "unknown error");
+  } catch (e) { console.error("welcome sms:", e.message); }
+};
+
+// SMS to the customer when a job is started for his vehicle(s) from the CRM
+const sendJobStartedSms = async (customerId, jobs) => {
+  try {
+    if (!welcomeSms?.sendSms) { console.error("job sms: services/sms.service was not found"); return; }
+    welcomeSms.setPool?.(pool);
+    const c = await pool.query("SELECT customer_name, contact_number FROM customer WHERE id = $1", [customerId]);
+    const cu = c.rows[0];
+    if (!cu || !clean(cu.contact_number)) return;
+    const company = (await welcomeSms.getSmsSettings?.().catch(() => null))?.companyName || "KARUNARATHNE AUTO ZONE";
+    const first = String(cu.customer_name || "").trim().split(/\s+/)[0] || "Customer";
+    const list = jobs.map((j) => `${j.regNo} (${j.jobNo})`).join(", ");
+    const text = `Dear ${first}, we have received your vehicle ${list} and your job ${jobs.length > 1 ? "cards are" : "card is"} now open. We will keep you updated. Thank you for choosing ${company}.`;
+    const out = await welcomeSms.sendSms(cu.contact_number, text, { kind: "jobStarted" });
+    if (out?.sent) console.log("job sms sent to", out.to); else console.error("job sms not sent:", out?.error || "unknown error");
+  } catch (e) { console.error("job sms:", e.message); }
+};
+
 router.post("/customers", authenticateToken, async (req, res) => {
   const b = req.body || {};
  
@@ -640,6 +677,9 @@ router.post("/customers", authenticateToken, async (req, res) => {
     }
  
     await client.query("COMMIT");
+
+    // a NEW customer gets a welcome SMS (sent after the save; a failed SMS never fails the registration)
+    if (!existingErpId) sendWelcomeSms({ phone: String(b.contactNumber).trim(), name: clean(b.customerName), erpId: customer.erp_customer_id });
  
     return res.status(201).json({
       message: existingErpId ? "Customer updated successfully" : "Customer saved successfully",
@@ -973,7 +1013,7 @@ router.post("/jobs", authenticateToken, async (req, res) => {
     }
  
     await client.query("COMMIT");
- 
+
     // Push notification to the selected consultant (fire and forget - a failed push never breaks Start Job)
     const many = jobs.length > 1;
     sendPushToUser(consultantId, {
@@ -981,7 +1021,9 @@ router.post("/jobs", authenticateToken, async (req, res) => {
       body: jobs.map((j) => `${j.jobNo} · ${j.regNo}`).join(", "),
       tag: `new-job-${jobs[0].id}`,
     });
- 
+
+    sendJobStartedSms(customerId, jobs); // fire and forget - a failed SMS never breaks Start Job
+
     return res.status(201).json({ message: "Job started successfully", jobs });
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch (_) { /* ignore */ }
@@ -1011,13 +1053,13 @@ async function canOpenJob(req, jobId) {
   const r = await pool.query("SELECT 1 FROM job WHERE id = $1 AND consultant_id = $2", [jobId, own]);
   return r.rowCount > 0;
 }
- 
+
 // A live job whose current stage has been open longer than this is "overdue" (dashboard badge + Overdue tab)
 const OVERDUE_HOURS = 24;
 const overdueSql = (alias) => `(${alias}.status = 'IN_PROGRESS' AND EXISTS (
   SELECT 1 FROM job_stage os WHERE os.job_id = ${alias}.id AND os.stage_no = ${alias}.current_stage_no
      AND os.started_at < now() - make_interval(hours => ${OVERDUE_HOURS})))`;
- 
+
 /* ------------------ Jobs table: shared SELECT / FROM ------------------ */
 const JOB_COLUMNS = `SELECT
          j.id,
@@ -1095,6 +1137,7 @@ router.get("/jobs", authenticateToken, async (req, res) => {
        ${JOB_FROM}
        WHERE ($1::text IS NULL OR lower(d.name) = lower($1::text))
          AND ($2::int IS NULL OR j.consultant_id = $2::int)
+         AND j.status IS DISTINCT FROM 'CANCELLED'          -- cancelled jobs are not shown on the dashboards (the Jobs page still lists them)
        ORDER BY j.id DESC
        LIMIT 200`,
       [department, own]
@@ -1531,16 +1574,17 @@ router.get("/jobs/:id/stage-details", authenticateToken, async (req, res) => {
       const labour = a.includeLabour ? labLines.reduce((t, x) => t + (x.amount || 0), 0) : 0;
       const manual = (a.manualItems || []).reduce((t, m) => t + (Number(m.amount) || 0), 0);
       const wash = (a.washItems || []).reduce((t, w) => t + (Number(w.price) || 0), 0);
-      const mk = await pool.query("SELECT COALESCE(price_markup_percent, 0)::float AS p FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] }));
-      const markupPercent = mk.rows[0]?.p || 0;
+      const mk = await pool.query("SELECT COALESCE(price_markup_percent, 0)::float AS p, COALESCE(spare_markup_percent, price_markup_percent, 0)::float AS sp FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] }));
+      const markupPercent = mk.rows[0]?.p || 0;                       // repair + manual lines
+      const sparePercent = mk.rows[0]?.sp ?? markupPercent;           // spare parts + third-party items have their own %
       // the % is added to the UNIT PRICE of each line: markup of a line = qty x (unit price + % - unit price)
-      const lineAdj = (q, u) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + markupPercent)) / 100 - (Number(u) || 0)) * 100) / 100;
+      const lineAdj = (q, u, pc = markupPercent) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + pc)) / 100 - (Number(u) || 0)) * 100) / 100;
       const markup = Math.round((
-        (a.includeSpareParts ? partLines.reduce((s, x) => s + lineAdj(x.qty, x.unitPrice), 0) + quotes.reduce((s, x) => s + lineAdj(1, x.quotedPrice), 0) : 0)
+        (a.includeSpareParts ? partLines.reduce((s, x) => s + lineAdj(x.qty, x.unitPrice, sparePercent), 0) + quotes.reduce((s, x) => s + lineAdj(1, x.quotedPrice, sparePercent), 0) : 0)
         + (a.includeLabour ? labLines.reduce((s, x) => s + lineAdj(x.qty || 1, x.unitPrice ?? x.amount), 0) : 0)
         + (a.manualItems || []).reduce((s, m) => s + lineAdj(1, m.amount), 0)
       ) * 100) / 100;
-      estimate = { ...a, spare, labour, manual, wash, markup, markupPercent, total: Math.round((spare + labour + manual + markup + wash) * 100) / 100 };
+      estimate = { ...a, spare, labour, manual, wash, markup, markupPercent, sparePercent, total: Math.round((spare + labour + manual + markup + wash) * 100) / 100 };
     }
     const checked = new Set(intChecks.rows.map((x) => x.itemId));
     return res.json({
@@ -1605,4 +1649,3 @@ router.get("/jobs/:id/history", authenticateToken, async (req, res) => {
 });
  
 module.exports = router;
- 

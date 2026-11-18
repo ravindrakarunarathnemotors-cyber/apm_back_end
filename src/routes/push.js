@@ -71,7 +71,7 @@ router.post("/push/unsubscribe", authenticateToken, async (req, res) => {
 /* GET /api/my-notifications?limit=30  -> { items: [...], unread } */
 router.get("/my-notifications", authenticateToken, async (req, res) => {
   const uid = userIdOf(req);
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100);
   try {
     const [items, unread] = await Promise.all([
       pool.query(

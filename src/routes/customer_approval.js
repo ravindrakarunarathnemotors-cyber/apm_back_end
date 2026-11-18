@@ -16,18 +16,26 @@ const fs = require("fs");
 const path = require("path");
 
 const S3Service = require('./s3Service');
+const { randomBytes } = require("node:crypto");
+const { sendSms, toSriLankaNumber, renderSms, getLogisticsNumber } = require("../services/sms.service");
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 
 const router = express.Router();
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});
+pool.query("ALTER TABLE job_spare_quote ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});   // lines of the Extra Job Scope carry extra_scope_id; this stage shows only its own lines
 
  
 // Adds the columns of the "customer brings the spare parts" report by itself (so no SQL file has to be run by hand)
 pool.query("ALTER TABLE job_customer_approval ADD COLUMN IF NOT EXISTS client_parts jsonb NOT NULL DEFAULT '[]'::jsonb, ADD COLUMN IF NOT EXISTS client_parts_token text")
   .catch((e) => console.error("customer approval: could not add the client_parts columns (run add_client_parts.sql):", e.code, e.message));
  
+// the estimate page the customer opens from the SMS link (the document is saved when the SMS is sent)
+pool.query("ALTER TABLE job_customer_approval ADD COLUMN IF NOT EXISTS estimate_token text, ADD COLUMN IF NOT EXISTS estimate_html text")
+  .catch((e) => console.error("customer approval: could not add the estimate_token / estimate_html columns:", e.code, e.message));
+
 const VIA = ["SMS", "WHATSAPP", "ERP", "PHONE_CALL", "EMAIL"];   // the window now offers SMS only; the old values stay valid for saved jobs
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
@@ -55,12 +63,30 @@ const duration = (v) => {
 };
 const lines = (v, max = 300) => (Array.isArray(v) ? v : []).map((x) => clean(x)).filter(Boolean).map((x) => x.slice(0, max)).slice(0, 30);
  
+// The customer's address column (named differently in some databases): found once, empty when the customer table has none
+let addressColumn;
+async function findAddressColumn(db) {
+  if (addressColumn !== undefined) return addressColumn;
+  try {
+    const r = await db.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'customer' AND column_name = ANY($1::text[])
+        ORDER BY array_position($1::text[], column_name::text) LIMIT 1`,
+      [["address", "customer_address", "address_line1", "address1", "residential_address", "postal_address"]]);
+    addressColumn = r.rows[0]?.column_name || null;
+  } catch (_) { addressColumn = null; }
+  return addressColumn;
+}
+
 async function loadJob(db, jobId) {
+  const col = await findAddressColumn(pool);   // one of the fixed names above, so it is safe to put in the query
   const r = await db.query(
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
             j.department_id AS "departmentId", d.name AS "departmentName",
             COALESCE(d.has_customer_approval, false) AS "hasApproval", d.customer_approval_stage_no AS "approvalStageNo",
-            c.customer_name AS "customerName", c.contact_number AS "contactNumber"
+            c.customer_name AS "customerName", c.contact_number AS "contactNumber", c.email AS "customerEmail",
+            ${col ? `c.${col}::text` : "NULL::text"} AS "customerAddress",
+            j.chassis_no AS "chassisNo", j.engine_no AS "engineNo", j.year_of_manufacture AS "yearOfManufacture",
+            j.colour AS "colour", j.mileage_km AS "mileageKm", j.tyre_size AS "tyreSize"
      FROM job j JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`, [jobId]);
   return r.rows[0] || null;
 }
@@ -69,8 +95,8 @@ const reached = (job) => job.status === "IN_PROGRESS" && job.hasApproval && job.
 // Everything this stage shows from the earlier stages
 async function context(db, jobId) {
   const [parts, quotes, repairs, causes, wash, mk, treeRows] = await Promise.all([
-    db.query(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part WHERE job_id = $1 ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
-    db.query(`SELECT description, quoted_price::float AS "quotedPrice" FROM job_spare_quote WHERE job_id = $1 AND quoted_price IS NOT NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
+    db.query(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
+    db.query(`SELECT id, description, quoted_price::float AS "quotedPrice" FROM job_spare_quote WHERE job_id = $1 AND quoted_price IS NOT NULL AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
     db.query(`SELECT description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_repair_item WHERE job_id = $1 AND status = 'ACTIVE' ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
     db.query(`SELECT description FROM job_inspection_item WHERE job_id = $1 AND kind = 'ROOT_CAUSE' ORDER BY sort_order, id`, [jobId]).catch(() => ({ rows: [] })),
     // Wash types + prices come from the Wash department's "Wash Type" / "Repair Type" list (Jobs Dashboard > Repair Type)
@@ -81,7 +107,7 @@ async function context(db, jobId) {
        JOIN department d ON d.id = l.department_id
        WHERE lower(d.name) = 'wash' AND (l.code IN ('REPAIR_TYPE', 'WASH_TYPE') OR l.title ~* '(wash|repair) type') AND o.is_active AND l.is_active
        ORDER BY o.sort_order, o.id`).catch(() => ({ rows: [] })),
-    db.query("SELECT COALESCE(price_markup_percent, 0)::float AS p FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] })),
+    db.query("SELECT COALESCE(price_markup_percent, 0)::float AS p, COALESCE(spare_markup_percent, price_markup_percent, 0)::float AS sp FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] })),
     // every repair type with its child types + labour price (the job's own department first), to add an extra agreed item
     db.query(
       `SELECT p.name AS parent, c.id AS "childId", c.name AS "childName", c.price::float AS price, d.name AS department, (l.department_id = j.department_id) AS "isCurrent"
@@ -110,7 +136,7 @@ async function context(db, jobId) {
   return {
     parts: parts.rows, quotes: quotes.rows, sparePartsValue: Math.round(sparePartsValue * 100) / 100,
     labour: repairs.rows, labourTotal: Math.round(labourTotal * 100) / 100,
-    rootCauses: causes.rows.map((r) => r.description), washOptions, repairTree, markupPercent: mk.rows[0]?.p || 0,
+    rootCauses: causes.rows.map((r) => r.description), washOptions, repairTree, markupPercent: mk.rows[0]?.p || 0, sparePercent: mk.rows[0]?.sp ?? (mk.rows[0]?.p || 0),
   };
 }
  
@@ -139,25 +165,30 @@ function billable(saved, ctx) {
   const own = Array.isArray(saved.clientParts) ? saved.clientParts.map(Number) : [];
   const labour = ctx.labour.filter((l) => !l.warrantyClaim && (saved.decision !== "PARTIAL" || agreed.includes(scopeKey(l))));
   const parts = ctx.parts.filter((p) => !p.warrantyClaim && !(saved.partsBy === "CLIENT" && own.includes(Number(p.id))));
-  return { labour, parts };
+  // third-party items the customer brings himself are saved as the negative number of the quotation id
+  const quotes = ctx.quotes.filter((q) => !(saved.partsBy === "CLIENT" && own.includes(-Number(q.id))));
+  return { labour, parts, quotes };
 }
 function totals(saved, ctx) {
-  const { labour: labourLines, parts: partLines } = billable(saved, ctx);
-  const spare = saved.includeSpareParts ? partLines.reduce((s, r) => s + r.qty * r.unitPrice, 0) + ctx.quotes.reduce((s, q) => s + q.quotedPrice, 0) : 0;
+  const { labour: labourLines, parts: partLines, quotes: quoteLines } = billable(saved, ctx);
+  const inclQ = saved.includeQuotes ?? saved.includeSpareParts;   // third-party quotations can be left out of the estimate
+  const spare = (saved.includeSpareParts ? partLines.reduce((s, r) => s + r.qty * r.unitPrice, 0) : 0) + (inclQ ? quoteLines.reduce((s, q) => s + q.quotedPrice, 0) : 0);
   const labour = saved.includeLabour ? labourLines.reduce((s, r) => s + (r.amount || 0), 0) : 0;
   const manual = saved.manualItems.reduce((s, m) => s + (Number(m.amount) || 0), 0);
   const wash = saved.washItems.reduce((s, w) => s + (Number(w.price) || 0), 0);
   const repairCost = labour + manual;
-  // price adjustment (markup %) of the job: added to EACH spare part / quotation / repair / manual line separately (not on wash)
+  // price adjustment (markup %) of the job: repair + manual lines use the repair %, spare parts / quotations use their own % (not on wash)
   const pct = Number(ctx.markupPercent) || 0;
+  const spct = Number(ctx.sparePercent ?? ctx.markupPercent) || 0;
   // the % is added to the UNIT PRICE of each line: markup of a line = qty x (unit price + % - unit price)
-  const lineAdj = (q, u) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + pct)) / 100 - (Number(u) || 0)) * 100) / 100;
+  const lineAdj = (q, u, pc = pct) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + pc)) / 100 - (Number(u) || 0)) * 100) / 100;
   let markup = 0;
-  if (saved.includeSpareParts) markup += partLines.reduce((s, r) => s + lineAdj(r.qty, r.unitPrice), 0) + ctx.quotes.reduce((s, q) => s + lineAdj(1, q.quotedPrice), 0);
+  if (saved.includeSpareParts) markup += partLines.reduce((s, r) => s + lineAdj(r.qty, r.unitPrice, spct), 0);
+  if (inclQ) markup += quoteLines.reduce((s, q) => s + lineAdj(1, q.quotedPrice, spct), 0);
   if (saved.includeLabour) markup += labourLines.reduce((s, r) => s + lineAdj(r.qty || 1, r.unitPrice ?? r.amount), 0);
   markup += saved.manualItems.reduce((s, m) => s + lineAdj(1, m.amount), 0);
   markup = Math.round(markup * 100) / 100;
-  return { spare, labour, manual, repairCost, markup, markupPercent: Number(ctx.markupPercent) || 0, wash, total: Math.round((spare + repairCost + markup + wash) * 100) / 100 };
+  return { spare, labour, manual, repairCost, markup, markupPercent: Number(ctx.markupPercent) || 0, sparePercent: Number(ctx.sparePercent ?? ctx.markupPercent) || 0, wash, total: Math.round((spare + repairCost + markup + wash) * 100) / 100 };
 }
  
 // GET /jobs/:id/customer-approval
@@ -213,7 +244,8 @@ router.put("/jobs/:id/customer-approval", authenticateToken, async (req, res) =>
     const files = (Array.isArray(b.clientPartsFiles) ? b.clientPartsFiles : []).slice(0, 10)
       .map((f) => ({ url: clean(f?.url)?.slice(0, 500), name: clean(f?.name)?.slice(0, 200) || "Spare part list" })).filter((f) => f.url);
     // the spare parts the customer brings (ids of this job's spare parts)
-    const partIds = new Set(ctx.parts.map((p) => p.id));
+    // (a third-party quotation item the customer brings is the negative number of its id)
+    const partIds = new Set([...ctx.parts.map((p) => p.id), ...ctx.quotes.map((q) => -q.id)]);
     const clientParts = [...new Set((Array.isArray(b.clientParts) ? b.clientParts : []).map(Number).filter((n) => Number.isInteger(n) && partIds.has(n)))];
     const next = {
       ...g.saved, includeSpareParts: b.includeSpareParts !== false, includeLabour: b.includeLabour !== false, manualItems, washItems,
@@ -268,7 +300,7 @@ router.post("/jobs/:id/customer-approval/send-parts-sms", authenticateToken, asy
     const token = cur.rows[0]?.client_parts_token || randomBytes(24).toString("hex");
     await pool.query("UPDATE job_customer_approval SET client_parts_token = $1, client_list_sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2", [token, g.jobId]);
     const base = String(process.env.PUBLIC_API_URL || `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
-    const text = await renderSms("partsList", { regNo: g.job.regNo, jobNo: g.job.jobNo, link: `${base}/evidence/public/client-parts/${token}` });
+    const text = await renderSms("partsList", { regNo: g.job.regNo, jobNo: g.job.jobNo, link: `${base}${req.baseUrl || "/evidence"}/public/client-parts/${token}` });
     const c = await pool.query(
       `SELECT COALESCE(NULLIF(c.alt_contact_number, ''), c.contact_number) AS phone, c.contact_number AS main_phone
        FROM job j JOIN customer c ON c.id = j.customer_id WHERE j.id = $1`, [g.jobId]);
@@ -291,7 +323,12 @@ router.get("/public/client-parts/:token", async (req, res) => {
     if (r.rowCount === 0) return res.status(404).send("Report not found");
     const row = r.rows[0];
     const ids = (Array.isArray(row.client_parts) ? row.client_parts : []).map(Number).filter(Number.isInteger);
-    const parts = ids.length ? (await pool.query("SELECT name, brand, quality, qty FROM job_spare_part WHERE job_id = $1 AND id = ANY($2::int[]) ORDER BY id", [row.job_id, ids])).rows : [];
+    const partIdList = ids.filter((n) => n > 0), quoteIdList = ids.filter((n) => n < 0).map((n) => -n);
+    const parts = partIdList.length ? (await pool.query("SELECT name, brand, quality, qty FROM job_spare_part WHERE job_id = $1 AND id = ANY($2::int[]) ORDER BY id", [row.job_id, partIdList])).rows : [];
+    if (quoteIdList.length) {   // third-party items the customer brings
+      const qs = await pool.query("SELECT description FROM job_spare_quote WHERE job_id = $1 AND id = ANY($2::int[]) ORDER BY id", [row.job_id, quoteIdList]);
+      for (const q of qs.rows) parts.push({ name: q.description, brand: "Third party", quality: "", qty: 1 });
+    }
     const files = (Array.isArray(row.client_parts_files) ? row.client_parts_files : []).filter((f) => /^https?:\/\//i.test(f?.url || ""));
     const extra = await pool.query(
       `SELECT c.customer_name, to_char(CURRENT_DATE, 'DD Mon YYYY') AS today, d.name AS department
@@ -340,8 +377,8 @@ td{padding:8px;border-bottom:1px solid var(--line)}tr:nth-child(even) td{backgro
   </dl>
   ${info.department ? `<div class="note">Department: ${esc(info.department)} · Please bring the spare parts listed below to the workshop.</div>` : ""}
   <h2>Spare parts to bring</h2>
-  <table><thead><tr><th class="c">#</th><th>Spare part</th><th>Brand</th><th>Quality</th><th class="r">Qty</th></tr></thead><tbody>
-  ${parts.map((p, n) => `<tr><td class="c">${n + 1}</td><td><b>${esc(p.name)}</b></td><td>${esc(p.brand || "-")}</td><td>${esc(p.quality || "-")}</td><td class="r"><b>${esc(p.qty)}</b></td></tr>`).join("") || `<tr><td colspan="5" style="color:#78716c">See the attached list below.</td></tr>`}
+  <table><thead><tr><th class="c">#</th><th>Spare part</th><th class="r">Qty</th></tr></thead><tbody>
+  ${parts.map((p, n) => `<tr><td class="c">${n + 1}</td><td><b>${esc(p.name)}</b></td><td class="r"><b>${esc(p.qty)}</b></td></tr>`).join("") || `<tr><td colspan="3" style="color:#78716c">See the attached list below.</td></tr>`}
   </tbody></table>
   ${parts.length ? `<div class="sum"><div>${parts.length} item(s) · Total qty ${totalQty}</div></div>` : ""}
   ${files.length ? `<h2>Attached list</h2><div class="files">${files.map((f) => `<div><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.name || "Spare part list")}</a></div>`).join("")}</div>` : ""}
@@ -351,6 +388,35 @@ td{padding:8px;border-bottom:1px solid var(--line)}tr:nth-child(even) td{backgro
   } catch (e) { console.error("public client parts:", e.code, e.message); return res.status(500).send("Server error"); }
 });
  
+// GET /public/estimate/:token   (NO login - the long random token is the key): the estimate the customer got by SMS
+router.get("/public/estimate/:token", async (req, res) => {
+  const token = clean(req.params.token);
+  if (!token || !/^[a-f0-9]{16,64}$/.test(token)) return res.status(404).send("Estimate not found");
+  try {
+    const r = await pool.query("SELECT estimate_html FROM job_customer_approval WHERE estimate_token = $1", [token]);
+    let html = r.rows[0]?.estimate_html;
+    if (!html) return res.status(404).send("Estimate not found");
+    // phone friendly; no scripts can run on this page
+    html = html.replace("<head>", `<head><meta name="viewport" content="width=device-width,initial-scale=1"><style>@media(max-width:620px){.page{padding:14px 12px!important}.top{flex-wrap:wrap}.top>.doc{max-width:none!important;text-align:left!important}.parties{grid-template-columns:1fr!important}.meta{grid-template-columns:1fr 1fr!important}table{font-size:11px}}</style>`);
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("X-Robots-Tag", "noindex");
+    res.set("Content-Security-Policy", "default-src 'none'; img-src * data:; style-src 'unsafe-inline'; font-src * data:");
+    return res.send(html);
+  } catch (e) { console.error("public estimate:", e.code, e.message); return res.status(500).send("Server error"); }
+});
+
+// GET /public/estimate-data/:token   (NO login): the estimate document for the website page /estimate/<token>
+router.get("/public/estimate-data/:token", async (req, res) => {
+  const token = clean(req.params.token);
+  if (!token || !/^[a-f0-9]{16,64}$/.test(token)) return res.status(404).json({ message: "Estimate not found" });
+  try {
+    const r = await pool.query("SELECT a.estimate_html AS html, j.job_no AS \"jobNo\" FROM job_customer_approval a JOIN job j ON j.id = a.job_id WHERE a.estimate_token = $1", [token]);
+    if (!r.rows[0]?.html) return res.status(404).json({ message: "Estimate not found" });
+    res.set("X-Robots-Tag", "noindex");
+    return res.json({ html: r.rows[0].html, jobNo: r.rows[0].jobNo });
+  } catch (e) { console.error("public estimate data:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+});
+
 // POST /jobs/:id/customer-approval/logistics   { kind: "REPAIR" | "THIRD_PARTY", note? }
 //   REPAIR      = "Send Repair Request to Logistic and Stock Department"
 //   THIRD_PARTY = "Request to purchase from third parties (from Logistic and Stock Department)"
@@ -385,6 +451,86 @@ router.post("/jobs/:id/customer-approval/logistics", authenticateToken, async (r
   } catch (e) { console.error("approval logistics:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
  
+// ---- Reminders for "the customer brings the spare parts" ----
+// The push function is found by name in this folder (same way as the spare parts file does it)
+let sendPushToUser = null;
+{
+  const fsx = require("node:fs"), pathx = require("node:path");
+  let found = ["push.routes", "push", "pushRoutes", "push.route", "push_routes", "notification.routes", "notifications"].map((n) => `./${n}`);
+  try { found = found.concat(fsx.readdirSync(__dirname).filter((x) => /^push.*\.js$/i.test(x) && x !== pathx.basename(__filename)).map((x) => `./${x}`)); } catch (_) { /* ignore */ }
+  for (const p of found) {
+    try { const m = require(p); if (typeof m?.sendPushToUser === "function") { sendPushToUser = m.sendPushToUser; break; } }
+    catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes(p.replace("./", ""))) console.error(`push file ${p}:`, e.message); }
+  }
+}
+
+// How many spare parts the customer brings (Customer Approval ticks), else all parts of the job
+async function clientPartsCount(jobId, saved) {
+  const n = (saved.clientParts || []).length;
+  if (n > 0) return n;
+  const r = await pool.query("SELECT (SELECT COUNT(*) FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL)::int + (SELECT COUNT(*) FROM job_spare_quote WHERE job_id = $1 AND extra_scope_id IS NULL)::int AS n", [jobId]);
+  return r.rows[0]?.n || 0;
+}
+// Bell notification + push to everybody with the Inventory & Spare Parts privilege
+async function pushInventoryReminder(job, jobId, n) {
+  if (!sendPushToUser) throw Object.assign(new Error("The notification service was not found on the server"), { status: 500 });
+  const envIds = String(process.env.INVENTORY_MENU_IDS || "").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x) && Number(x) > 0).map(Number);
+  const menu = envIds.length
+    ? await pool.query("SELECT id, route FROM admin_uimenudata WHERE id = ANY($1::int[])", [envIds])
+    : await pool.query(`SELECT id, route FROM admin_uimenudata WHERE status <> 'permission' AND (name ILIKE '%inventory%' OR route ILIKE '%inventory%') ORDER BY (route IS NULL OR route IN ('#', '')), id`);
+  if (menu.rowCount === 0) throw Object.assign(new Error("The Inventory & Spare Parts menu was not found"), { status: 404 });
+  const ids = menu.rows.map((m) => m.id);
+  const base = process.env.INVENTORY_PUSH_URL || menu.rows.find((m) => m.route && m.route !== "#")?.route || "/";
+  const url = `${base}${base.includes("?") ? "&" : "?"}tab=jobcards&job=${jobId}`;
+  const users = await pool.query(
+    `SELECT DISTINCT u.id FROM admin_user u JOIN admin_role r ON r.id = u.role_id
+      WHERE r.privileges::text[] && $1::text[] AND COALESCE(r.status, 'active') = 'active'`, [ids.map(String)]);
+  for (const u of users.rows) {
+    await sendPushToUser(u.id, { title: "Reminder · spare parts", body: `${job.jobNo} · ${job.regNo}: ${n > 0 ? `${n} part${n === 1 ? "" : "s"} - ` : ""}please prepare the spare parts (${job.departmentName || "-"})`, url });
+  }
+  return users.rowCount;
+}
+async function smsCustomerReminder(job, jobId, n, phoneOverride) {
+  const what = n > 0 ? `the ${n} spare part${n === 1 ? "" : "s"}` : "the spare parts";
+  const text = `Dear ${job.customerName || "Customer"}, please bring ${what} for your vehicle ${job.regNo} (Job ${job.jobNo}) to KARUNARATHNE AUTO ZONE so that we can continue the repair. Thank you.`;
+  const c = await pool.query(
+    `SELECT COALESCE(NULLIF(c.alt_contact_number, ''), c.contact_number) AS phone, c.contact_number AS main_phone
+     FROM job j JOIN customer c ON c.id = j.customer_id WHERE j.id = $1`, [jobId]);
+  const row = c.rows[0] || {};
+  let sms = await sendSms(phoneOverride || row.phone, text, { kind: "partsReminder" });
+  if (!sms.sent && !phoneOverride && row.main_phone && row.main_phone !== row.phone) sms = await sendSms(row.main_phone, text, { kind: "partsReminder" });
+  return sms;
+}
+// Loads the job at ANY stage (Customer Approval, Internal Inspection - 1 ...)
+async function loadAny(req, res) {
+  const jobId = toInt(req.params.id);
+  if (!Number.isInteger(jobId)) { res.status(400).json({ message: "Invalid job" }); return null; }
+  const job = await loadJob(pool, jobId);
+  if (!job) { res.status(404).json({ message: "Job not found" }); return null; }
+  return { job, jobId, saved: await loadSaved(pool, jobId) };
+}
+// POST /jobs/:id/customer-approval/remind-inventory   and   /jobs/:id/internal-inspection/notify-inventory
+const remindInventoryRoute = async (req, res) => {
+  try {
+    const g = await loadAny(req, res); if (!g) return;
+    const n = await clientPartsCount(g.jobId, g.saved);
+    return res.json({ notified: await pushInventoryReminder(g.job, g.jobId, n) });
+  } catch (e) { console.error("remind inventory:", e.code, e.message); return res.status(e.status || 500).json({ message: e.status ? e.message : "Server error" }); }
+};
+// POST /jobs/:id/customer-approval/remind-customer-parts   and   /jobs/:id/internal-inspection/notify-customer   { phone? }
+const remindCustomerRoute = async (req, res) => {
+  try {
+    const g = await loadAny(req, res); if (!g) return;
+    const phoneOverride = clean(req.body?.phone);
+    if (phoneOverride && !toSriLankaNumber(phoneOverride)) return res.status(400).json({ message: "Enter a valid mobile number (07XXXXXXXX)" });
+    return res.json({ sms: await smsCustomerReminder(g.job, g.jobId, await clientPartsCount(g.jobId, g.saved), phoneOverride) });
+  } catch (e) { console.error("remind customer:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+};
+router.post("/jobs/:id/customer-approval/remind-inventory", authenticateToken, remindInventoryRoute);
+router.post("/jobs/:id/internal-inspection/notify-inventory", authenticateToken, remindInventoryRoute);
+router.post("/jobs/:id/customer-approval/remind-customer-parts", authenticateToken, remindCustomerRoute);
+router.post("/jobs/:id/internal-inspection/notify-customer", authenticateToken, remindCustomerRoute);
+
 // POST /jobs/:id/customer-approval/complete -> the stage is finished, the job moves on
 // POST /jobs/:id/customer-approval/send-sms   { includeSpareParts, includeLabour, time?, phone? }
 // SMSes the estimate (total, with the price adjustment, warranty claims not charged) to the customer: the WhatsApp / alternative number first, then the main mobile.
@@ -398,7 +544,7 @@ router.post("/jobs/:id/customer-approval/send-sms", authenticateToken, async (re
     // full = the estimate sent BEFORE the customer confirmation: every repair and spare part, no agreement applied yet
     const full = req.body?.full === true;
     const base = full ? { ...g.saved, decision: null, agreedScope: [], partsBy: null, clientParts: [] } : g.saved;
-    const t = totals({ ...base, includeSpareParts: req.body?.includeSpareParts !== false, includeLabour: req.body?.includeLabour !== false, manualItems: [], washItems: [] }, ctx);
+    const t = totals({ ...base, includeSpareParts: req.body?.includeSpareParts !== false, includeQuotes: req.body?.includeQuotes === undefined ? undefined : req.body.includeQuotes !== false, includeLabour: req.body?.includeLabour !== false, manualItems: [], washItems: [] }, ctx);
     if (!(t.total > 0)) return res.status(400).json({ message: "The estimate total is Rs. 0.00, nothing to send" });
     const c = await pool.query(
       `SELECT COALESCE(NULLIF(c.alt_contact_number, ''), c.contact_number) AS phone, c.contact_number AS main_phone
@@ -406,7 +552,26 @@ router.post("/jobs/:id/customer-approval/send-sms", authenticateToken, async (re
     const row = c.rows[0] || {};
     const time = clean(req.body?.time)?.slice(0, 60);
     const amount = t.total.toLocaleString("en-LK", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const text = await renderSms("estimate", { regNo: g.job.regNo, jobNo: g.job.jobNo, amount, time });
+    // the estimate document (made by the screen) is saved and the SMS gets a link to it, like the evidence report
+    let link = "";
+    const docHtml = typeof req.body?.html === "string" && req.body.html.length > 200 && req.body.html.length < 400000 ? req.body.html : null;
+    if (docHtml) {
+      try {
+        const cur = await pool.query("SELECT estimate_token FROM job_customer_approval WHERE job_id = $1", [g.jobId]);
+        const token = cur.rows[0]?.estimate_token || randomBytes(24).toString("hex");
+        await pool.query(
+          `INSERT INTO job_customer_approval (job_id, estimate_token, estimate_html, saved_by) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (job_id) DO UPDATE SET estimate_token = EXCLUDED.estimate_token, estimate_html = EXCLUDED.estimate_html, updated_at = CURRENT_TIMESTAMP`,
+          [g.jobId, token, docHtml, currentUserId(req)]);
+        // same as the evidence report: the customer opens a page of the website (/estimate/<token>), which reads the document from this server.
+        // ?p= tells the page where this router is mounted (req.baseUrl).  Without PUBLIC_APP_URL the link points to this server directly.
+        const app = String(process.env.PUBLIC_APP_URL || req.headers.origin || "").replace(/\/+$/, "");
+        const api = String(process.env.PUBLIC_API_URL || `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
+        link = app ? `${app}/estimate/${token}?p=${encodeURIComponent(req.baseUrl || "/evidence")}` : `${api}${req.baseUrl || "/evidence"}/public/estimate/${token}`;
+      } catch (e) { console.error("approval estimate link:", e.code, e.message); }
+    }
+    let text = await renderSms("estimate", { regNo: g.job.regNo, jobNo: g.job.jobNo, amount, time, link });
+    if (link && !text.includes(link)) text = `${text} View estimate: ${link}`;   // also when the saved SMS template has no {link}
     const trySms = async (to) => { try { return await sendSms(to, text, { kind: "estimate" }); } catch (e) { console.error("approval send sms (sms service):", e.message); return { sent: false, error: "Could not send the SMS" }; } };
     let sms = await trySms(phoneOverride || row.phone);
     if (!sms?.sent && !phoneOverride && row.main_phone && row.main_phone !== row.phone) sms = await trySms(row.main_phone);   // fall back to the main number
@@ -469,4 +634,3 @@ router.post("/jobs/:id/customer-approval/complete", authenticateToken, async (re
 module.exports = router;
 // used by invoice.routes.js (the invoice lines are the approved statement)
 module.exports.helpers = { context, loadSaved, billable, totals };
- 

@@ -16,8 +16,7 @@ const fs = require("fs");
 const path = require("path");
 const { randomBytes } = require("node:crypto");
 const S3Service = require('./s3Service');
-const { sendSms, toSriLankaNumber } = require("../services/sms.service"); 
-
+const { sendSms, toSriLankaNumber, renderSms } = require("../services/sms.service");
 dayjs.extend(utc);
 dayjs.extend(timezone);
 

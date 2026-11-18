@@ -23,17 +23,21 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});
+pool.query("ALTER TABLE job_spare_quote ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});   // lines of the Extra Job Scope carry extra_scope_id; this stage uses only its own lines
+
+
 // Who may add / remove / alternate repair items and re-save AFTER the head mechanic has signed ("use security to edit").
 // [] = nobody extra (the inspection is locked after signing);  [1] = role_id 1 (admin)
 const EDIT_AFTER_SIGN_ROLE_IDS = [1];
- 
+
 const REPAIR_TYPES = [
   "I. Periodic Maintenance", "II. General Repairs", "III. Mechanical Repairs", "VII. Suspension Repairs",
   "VIII. Brake Repairs", "IX. Steering Repairs", "X. Air Conditioning Repairs", "XI. Warranty Repairs",
   "XII. Insurance Repairs", "XIII. Accident Repairs", "XIV. Pre-Delivery Inspection (PDI)", "XV. Used Vehicle Inspection",
 ];
 const KINDS = ["FAULT", "IDENTIFIED_FAULT", "ROOT_CAUSE"];
- 
+
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
   return Number.isInteger(n) ? n : null;
@@ -51,14 +55,14 @@ const toInt = (v) => {
 };
 const toBool = (v) => (v === true || v === "true" ? true : v === false || v === "false" ? false : null);
 const lines = (v) => (Array.isArray(v) ? v : []).map((x) => clean(x)).filter(Boolean);
- 
+
 async function hasEditRole(req) {
   const uid = currentUserId(req);
   if (!uid || EDIT_AFTER_SIGN_ROLE_IDS.length === 0) return false;
   const r = await pool.query("SELECT role_id FROM admin_user WHERE id = $1", [uid]);
   return r.rowCount > 0 && EDIT_AFTER_SIGN_ROLE_IDS.includes(Number(r.rows[0].role_id));
 }
- 
+
 // the job + its department's inspection settings
 async function loadJob(db, jobId) {
   const r = await db.query(
@@ -72,18 +76,18 @@ async function loadJob(db, jobId) {
   );
   return r.rows[0] || null;
 }
- 
+
 // can this user record now?  (job open, department uses the inspection, the stage has been reached, and not locked by the signature)
 async function recordRights(req, job, signed) {
   const reached = job.status === "IN_PROGRESS" && job.hasJobInspection && job.stageNo >= job.inspectionStageNo;
   const editRole = signed ? await hasEditRole(req) : true;
   return { canRecord: reached && editRole, reached, locked: reached && signed && !editRole };
 }
- 
+
 const ITEM_SELECT = `SELECT id, description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty,
                             COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", status,
                             replaces_item_id AS "replacesItemId", changed_at AS "changedAt", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_repair_item`;
- 
+
 async function loadAll(db, job) {
   const jobId = job.id;
   const [ins, items, files, repairs, concerns, hist, groupRows, treeRows] = await Promise.all([
@@ -96,11 +100,10 @@ async function loadAll(db, job) {
     db.query(`SELECT id, file_name AS "fileName", file_url AS "fileUrl", mime_type AS "mimeType", created_at AS "createdAt" FROM job_inspection_file WHERE job_id = $1 ORDER BY id`, [jobId]),
     db.query(`${ITEM_SELECT} WHERE job_id = $1 ORDER BY id`, [jobId]),
     db.query(
-      `SELECT jc.complaint, o.concern_level AS "level", o.list_title AS "listTitle", o.option_name AS "name"
+      `SELECT jc.complaint, jc.remarks, o.concern_level AS "level", o.list_title AS "listTitle", o.option_name AS "name"
        FROM job_complaint jc LEFT JOIN job_complaint_option o ON o.job_complaint_id = jc.id WHERE jc.job_id = $1 ORDER BY o.id`, [jobId]),
-    db.query(
-      `SELECT job_no AS "jobNo", status, created_at AS "createdAt" FROM job WHERE reg_no = $1 AND id <> $2 ORDER BY id DESC LIMIT 5`,
-      [job.regNo, jobId]),
+    Promise.resolve({ rows: [] }),   // earlier jobs are loaded on demand: GET /jobs/:id/inspection/history
+
     // The repair types picked in the complaint stage (parents) and the child types (with labour price) defined under them
     db.query(
       `SELECT jco.option_name AS parent, c.id AS "childId", c.name AS "childName", c.price::float AS price
@@ -138,19 +141,19 @@ async function loadAll(db, job) {
   const of = (k) => items.rows.filter((r) => r.kind === k).map((r) => r.description);
   const active = repairs.rows.filter((r) => r.status === "ACTIVE");
   const main = concerns.rows.filter((r) => r.name && r.level === "MAIN").map((r) => ({ title: r.listTitle, name: r.name }));
-  const sub = concerns.rows.filter((r) => r.name && r.level === "SUB").map((r) => ({ title: r.listTitle, name: r.name }));
+  const sub = concerns.rows.filter((r) => r.name && r.level !== "MAIN")   // everything picked in Customer Concern recording that is not the main concern.map((r) => ({ title: r.listTitle, name: r.name }));
   return {
     inspection: ins.rows[0] || null,
     faults: of("FAULT"), identifiedFaults: of("IDENTIFIED_FAULT"), rootCauses: of("ROOT_CAUSE"),
     scannerFiles: files.rows,
     repairItems: repairs.rows,
     totalRepairValue: active.filter((r) => !r.warrantyClaim).reduce((s, r) => s + Number(r.amount), 0),
-    concerns: { complaint: concerns.rows[0]?.complaint || "", main, sub },
+    concerns: { complaint: concerns.rows[0]?.complaint || "", remarks: concerns.rows[0]?.remarks || "", main, sub },
     history: hist.rows,
     repairGroups, repairTree,
   };
 }
- 
+
 // GET /jobs/:id/inspection  (any logged-in user can read it, so other departments can open the scanner report / repair list)
 router.get("/jobs/:id/inspection", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -163,14 +166,34 @@ router.get("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     const signed = Boolean(data.inspection?.signedAt);
     const rights = await recordRights(req, job, signed);
     const dynamic = data.repairGroups.flatMap((g) => [g.parent, ...g.children.map((c) => c.label)]);
-    const mk = await pool.query("SELECT COALESCE(price_markup_percent, 0)::float AS p FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] }));
-    return res.json({ job, ...data, signed, ...rights, markupPercent: mk.rows[0]?.p || 0, markupOptions: await markupOptions(pool), repairTypes: dynamic.length ? dynamic : REPAIR_TYPES });
+    const mk = await pool.query("SELECT COALESCE(price_markup_percent, 0)::float AS p, spare_markup_percent::float AS sp FROM job WHERE id = $1", [jobId]).catch(() => ({ rows: [] }));
+    const repairPct = mk.rows[0]?.p || 0, spareSet = mk.rows[0]?.sp ?? null;
+    return res.json({ job, ...data, signed, ...rights, markupPercent: repairPct, sparePercent: spareSet ?? repairPct, sparePercentSame: spareSet === null, markupOptions: await markupOptions(pool), repairTypes: dynamic.length ? dynamic : REPAIR_TYPES });
   } catch (error) {
     console.error("Error loading the job inspection:", error.code, error.message);
     return res.status(500).json({ message: "Server error" });
   }
 });
- 
+
+// GET /jobs/:id/inspection/history?offset=0&limit=3  -> earlier jobs of the same vehicle, newest first, a few at a time (loaded only when needed)
+router.get("/jobs/:id/inspection/history", authenticateToken, async (req, res) => {
+  const jobId = toInt(req.params.id);
+  if (!Number.isInteger(jobId)) return res.status(400).json({ message: "Invalid job" });
+  const offset = Math.max(0, toInt(req.query.offset) || 0), limit = Math.min(20, Math.max(1, toInt(req.query.limit) || 3));
+  try {
+    const job = await loadJob(pool, jobId);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    const [rows, total] = await Promise.all([
+      pool.query(`SELECT id, job_no AS "jobNo", status, created_at AS "createdAt" FROM job WHERE reg_no = $1 AND id <> $2 ORDER BY id DESC LIMIT $3 OFFSET $4`, [job.regNo, jobId, limit, offset]),
+      pool.query("SELECT COUNT(*)::int AS n FROM job WHERE reg_no = $1 AND id <> $2", [job.regNo, jobId]),
+    ]);
+    return res.json({ items: rows.rows, total: total.rows[0].n, offset, hasMore: offset + rows.rows.length < total.rows[0].n });
+  } catch (error) {
+    console.error("Error loading the vehicle history:", error.code, error.message);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 // PUT /jobs/:id/inspection
 // { testRun, faultsFound, faults[], identifiedFaults[], rootCauses[], previousRepair, newRepair, warranty, historyRemarks,
 //   repairTypes[], complete?, signerName? }
@@ -201,7 +224,7 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     if (!signerName || signerName.length < 2 || signerName.length > 100) return res.status(400).json({ message: "Enter the head mechanic name" });
     if (!signatureImage) return res.status(400).json({ message: "The head mechanic must draw the signature" });
   }
- 
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -213,16 +236,24 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     const rights = await recordRights(req, job, signed);
     if (!rights.reached) { await client.query("ROLLBACK"); return res.status(409).json({ message: "This job is not ready for the job inspection" }); }
     if (!rights.canRecord) { await client.query("ROLLBACK"); return res.status(403).json({ message: "The head mechanic has signed this inspection. Only an authorised user can change it." }); }
- 
+
     // The spare parts are recorded in this same window (departments whose spare parts stage follows the inspection stage).
     // Signing therefore needs the spare parts list (or "No spare parts needed") and completes the spare parts stage too.
     const mergeSpare = Boolean(complete && job.hasSpareParts && job.stageNo === job.inspectionStageNo && job.spareStageNo === job.inspectionStageNo + 1);
     if (mergeSpare) {
-      const sp = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1", [jobId]);
+      const sp = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL", [jobId]);
       const hd = await client.query("SELECT no_parts_needed FROM job_spare_parts WHERE job_id = $1", [jobId]);
       if (sp.rows[0].n === 0 && !hd.rows[0]?.no_parts_needed) { await client.query("ROLLBACK"); return res.status(400).json({ message: "Add the spare parts, or tick 'No spare parts needed'" }); }
+      // the parts / quotation requests must be uploaded to Inventory & Spare Parts first
+      if (sp.rows[0].n > 0 || (await client.query("SELECT 1 FROM job_spare_quote WHERE job_id = $1 AND extra_scope_id IS NULL LIMIT 1", [jobId])).rowCount > 0) {
+        const up = await client.query(
+          `SELECT (SELECT link_sent_at FROM job_spare_parts WHERE job_id = $1) IS NOT NULL AS sent,
+                  EXISTS (SELECT 1 FROM job_spare_quote WHERE job_id = $1 AND status = 'REQUESTED' AND extra_scope_id IS NULL) AS "newQuotes",
+                  COALESCE((SELECT updated_at > link_sent_at FROM job_spare_parts WHERE job_id = $1), false) AS changed`, [jobId]);
+        if (!up.rows[0].sent || up.rows[0].newQuotes || up.rows[0].changed) { await client.query("ROLLBACK"); return res.status(409).json({ message: "First upload to Inventory: press \"Upload to ERP System\" in the spare parts section, then complete the inspection." }); }
+      }
     }
- 
+
     const userId = currentUserId(req);
     await client.query(
       `INSERT INTO job_inspection (job_id, test_run, faults_found, previous_repair, new_repair, warranty, history_remarks, repair_types, saved_by, extra_parents)
@@ -243,7 +274,7 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
         await client.query("INSERT INTO job_inspection_item (job_id, kind, description, sort_order) VALUES ($1, $2, $3, $4)", [jobId, kind, arr[n], n + 1]);
       }
     }
- 
+
     let stageNo = job.stageNo;
     let spareCompleted = false;
     if (complete) {
@@ -280,7 +311,7 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     client.release();
   }
 });
- 
+
 // ---- helpers for the small routes below: job + rights, or an error response ----
 async function guard(req, res) {
   const jobId = toInt(req.params.id);
@@ -313,7 +344,7 @@ const readItem = (b) => {
   if (repairType && repairType.length > 200) return { error: "Invalid repair type" };
   return { description, qty, unitPrice: Math.round(unitPrice * 100) / 100, amount, repairType };
 };
- 
+
 // POST /jobs/:id/inspection/repair-items   { description, amount, repairType? }   -> add
 router.post("/jobs/:id/inspection/repair-items", authenticateToken, async (req, res) => {
   try {
@@ -323,7 +354,7 @@ router.post("/jobs/:id/inspection/repair-items", authenticateToken, async (req, 
     return res.status(201).json(await repairList(g.jobId));
   } catch (e) { console.error("add repair item:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PUT /jobs/:id/inspection/repair-items/:itemId   { description, amount, repairType? }   -> ALTERNATE: the old line is kept as ALTERNATED, a new line replaces it
 router.put("/jobs/:id/inspection/repair-items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -338,9 +369,11 @@ router.put("/jobs/:id/inspection/repair-items/:itemId", authenticateToken, async
     return res.json(await repairList(g.jobId));
   } catch (e) { console.error("alternate repair item:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PUT /jobs/:id/inspection/markup   { percent }   -> price adjustment for the whole job (0, 2, 5, 8, 10 or 12 %)
 // the price adjustment (markup %) options of Settings > Pricing (always includes 0 = none); the old fixed list when nothing is saved
+// spare parts have their own price adjustment: NULL = follows the repair adjustment (job.price_markup_percent), a number = chosen separately
+pool.query("ALTER TABLE job ADD COLUMN IF NOT EXISTS spare_markup_percent NUMERIC(6,2)").catch((e) => console.error("spare_markup_percent ddl:", e.message));
 async function markupOptions(db) {
   try {
     const r = await db.query("SELECT value FROM app_setting WHERE group_key = 'pricing' AND key = 'adjustmentOptions'");
@@ -350,18 +383,23 @@ async function markupOptions(db) {
   return [0, 2, 5, 8, 10, 12];
 }
 router.put("/jobs/:id/inspection/markup", authenticateToken, async (req, res) => {
-  const percent = Number(req.body?.percent ?? 0);
-  if (!Number.isFinite(percent) || percent < 0 || percent > 50) return res.status(400).json({ message: "Select the price adjustment from the list" });
+  // { percent, target? }  target "repair" (default) = repair items | "spare" = spare parts (percent null = same as the repair adjustment)
+  const target = req.body?.target === "spare" ? "spare" : "repair";
+  const raw = req.body?.percent;
+  const sameAsRepair = target === "spare" && (raw === null || raw === "same");
+  const percent = sameAsRepair ? null : Number(raw ?? 0);
+  if (!sameAsRepair && (!Number.isFinite(percent) || percent < 0 || percent > 50)) return res.status(400).json({ message: "Select the price adjustment from the list" });
   try {
     const g = await guard(req, res); if (!g) return;
     const opts = await markupOptions(pool);
-    const cur = (await pool.query("SELECT COALESCE(price_markup_percent, 0)::float AS p FROM job WHERE id = $1", [g.jobId]).catch(() => ({ rows: [] }))).rows[0]?.p;
-    if (!opts.includes(percent) && percent !== cur) return res.status(400).json({ message: `Select one of: ${opts.map((x) => (x === 0 ? "None" : `${x}%`)).join(", ")}` });
-    await pool.query("UPDATE job SET price_markup_percent = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [percent, g.jobId]);
-    return res.json({ markupPercent: percent });
+    const col = target === "spare" ? "spare_markup_percent" : "price_markup_percent";
+    const cur = (await pool.query(`SELECT ${col}::float AS p FROM job WHERE id = $1`, [g.jobId]).catch(() => ({ rows: [] }))).rows[0]?.p;
+    if (!sameAsRepair && !opts.includes(percent) && percent !== cur) return res.status(400).json({ message: `Select one of: ${opts.map((x) => (x === 0 ? "None" : `${x}%`)).join(", ")}` });
+    await pool.query(`UPDATE job SET ${col} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [percent, g.jobId]);
+    return res.json({ target, percent });
   } catch (e) { console.error("set markup:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PATCH /jobs/:id/inspection/repair-items/:itemId/qty   { qty }   -> change only the quantity of an active line (amount = qty x unit price)
 router.patch("/jobs/:id/inspection/repair-items/:itemId/qty", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -381,7 +419,7 @@ router.patch("/jobs/:id/inspection/repair-items/:itemId/qty", authenticateToken,
     return res.json(await repairList(g.jobId));
   } catch (e) { console.error("repair item qty:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PATCH /jobs/:id/inspection/repair-items/:itemId/warranty   { claim }   -> mark / unmark an active line as a warranty claim (not charged)
 router.patch("/jobs/:id/inspection/repair-items/:itemId/warranty", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -393,7 +431,7 @@ router.patch("/jobs/:id/inspection/repair-items/:itemId/warranty", authenticateT
     return res.json(await repairList(g.jobId));
   } catch (e) { console.error("repair item warranty:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // DELETE /jobs/:id/inspection/repair-items/:itemId   -> remove (kept as REMOVED so the history stays)
 router.delete("/jobs/:id/inspection/repair-items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
@@ -405,7 +443,7 @@ router.delete("/jobs/:id/inspection/repair-items/:itemId", authenticateToken, as
     return res.json(await repairList(g.jobId));
   } catch (e) { console.error("remove repair item:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // POST /jobs/:id/inspection/files   { fileName, fileUrl, mimeType, size? }   (the browser uploads to /file/upload first, then registers it here)
 router.post("/jobs/:id/inspection/files", authenticateToken, async (req, res) => {
   const fileName = clean(req.body?.fileName), fileUrl = clean(req.body?.fileUrl);
@@ -420,7 +458,7 @@ router.post("/jobs/:id/inspection/files", authenticateToken, async (req, res) =>
     return res.status(201).json(r.rows[0]);
   } catch (e) { console.error("add inspection file:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // DELETE /inspection/files/:fileId
 router.delete("/inspection/files/:fileId", authenticateToken, async (req, res) => {
   const fileId = toInt(req.params.fileId);
@@ -434,6 +472,5 @@ router.delete("/inspection/files/:fileId", authenticateToken, async (req, res) =
     return res.json({ message: "Removed" });
   } catch (e) { console.error("remove inspection file:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 module.exports = router;
- 
