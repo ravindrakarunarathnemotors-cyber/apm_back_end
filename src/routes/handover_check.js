@@ -55,25 +55,43 @@ async function loadJob(db, jobId) {
      FROM job j JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`, [jobId]);
   return r.rows[0] || null;
 }
-const reached = (job) => job.status === "IN_PROGRESS" && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
+const reached = (job) => ["IN_PROGRESS", "COMPLETED"].includes(job.status) && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
 
-const sanitize = (b = {}) => ({
-  checks: [...new Set((Array.isArray(b.checks) ? b.checks : []).filter((k) => KEYS.includes(k)))],
+const sanitize = (b = {}) => {
+  const ans = {};
+  for (const k of KEYS) { const v = b.itemAnswers?.[k]; if (v === "YES" || v === "NO") ans[k] = v; }
+  return {
+  itemAnswers: ans,
+  checks: Object.keys(ans).filter((k) => ans[k] === "YES"),
   answer: b.answer === "YES" || b.answer === "RECHECK" ? b.answer : null,
   note: clean(b.note)?.slice(0, 1000) || null,
-});
+  };
+};
+
+pool.query("ALTER TABLE job_handover_check ADD COLUMN IF NOT EXISTS item_answers jsonb NOT NULL DEFAULT '{}'::jsonb").catch((e) => console.error("item_answers ddl:", e.message));   // { B: "YES" | "NO", ... }
+
+// payment status of the job's invoice (read-only): PAID | PARTIAL | UNPAID | CANCELLED, or null when no invoice exists yet
+async function invoiceInfo(db, jobId) {
+  try {
+    let root = jobId;
+    try { const j = await db.query("SELECT COALESCE(source_job_id, id) AS root FROM job WHERE id = $1", [jobId]); root = j.rows[0]?.root || jobId; } catch (_) { /* source_job_id column not there yet */ }
+    const r = await db.query(
+      `SELECT invoice_no AS "invoiceNo", status, total::float AS total, paid_amount::float AS paid, GREATEST(total - paid_amount, 0)::float AS balance FROM invoice WHERE job_id = $1`, [root]);
+    return r.rows[0] || null;
+  } catch (e) { console.error("handover invoice status:", e.code, e.message); return null; }
+}
 
 async function state(db, jobId) {
-  const h = await db.query(`SELECT checks, answer, COALESCE(note, '') AS note, completed_at AS "completedAt" FROM job_handover_check WHERE job_id = $1`, [jobId]);
-  const row = h.rows[0] || { checks: [], answer: null, note: "", completedAt: null };
-  return { items: ITEMS.map(([key, label]) => ({ key, label })), header: { ...row, checks: Array.isArray(row.checks) ? row.checks : [] } };
+  const h = await db.query(`SELECT checks, COALESCE(item_answers, '{}'::jsonb) AS "itemAnswers", answer, COALESCE(note, '') AS note, completed_at AS "completedAt" FROM job_handover_check WHERE job_id = $1`, [jobId]);
+  const row = h.rows[0] || { checks: [], itemAnswers: {}, answer: null, note: "", completedAt: null };
+  return { invoice: await invoiceInfo(db, jobId), items: ITEMS.map(([key, label]) => ({ key, label })), header: { ...row, checks: Array.isArray(row.checks) ? row.checks : [], itemAnswers: row.itemAnswers && typeof row.itemAnswers === "object" ? row.itemAnswers : {} } };
 }
 
 async function save(db, jobId, d, uid) {
   await db.query(
-    `INSERT INTO job_handover_check (job_id, checks, answer, note, saved_by) VALUES ($1, $2::jsonb, $3, $4, $5)
-     ON CONFLICT (job_id) DO UPDATE SET checks = EXCLUDED.checks, answer = EXCLUDED.answer, note = EXCLUDED.note, saved_by = EXCLUDED.saved_by, updated_at = CURRENT_TIMESTAMP`,
-    [jobId, JSON.stringify(d.checks), d.answer, d.note, uid]);
+    `INSERT INTO job_handover_check (job_id, checks, answer, note, saved_by, item_answers) VALUES ($1, $2::jsonb, $3, $4, $5, $6::jsonb)
+     ON CONFLICT (job_id) DO UPDATE SET checks = EXCLUDED.checks, item_answers = EXCLUDED.item_answers, answer = EXCLUDED.answer, note = EXCLUDED.note, saved_by = EXCLUDED.saved_by, updated_at = CURRENT_TIMESTAMP`,
+    [jobId, JSON.stringify(d.checks), d.answer, d.note, uid, JSON.stringify(d.itemAnswers)]);
 }
 
 // GET /jobs/:id/handover-check
@@ -113,7 +131,7 @@ router.post("/jobs/:id/handover-check/complete", authenticateToken, async (req, 
   const d = sanitize(req.body);
   if (d.answer !== "YES") return res.status(400).json({ message: "Select Yes: all the facts are cleared" });
   const left = KEYS.filter((k) => !d.checks.includes(k));
-  if (left.length) return res.status(400).json({ message: `Tick all the items first (${left.length} left)` });
+  if (left.length) return res.status(400).json({ message: `Select Yes for all the items first (${left.length} left). Use "Need to recheck" if something is not ready.` });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");

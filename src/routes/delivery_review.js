@@ -34,7 +34,7 @@ const ITEMS = [
   ["F", "Explain future needs if required"],
 ];
 const KEYS = ITEMS.map((x) => x[0]);
- 
+
 const currentUserId = (req) => {
   const n = Number(req.user?.user_id ?? req.user?.id);
   return Number.isInteger(n) ? n : null;
@@ -48,7 +48,7 @@ const toInt = (v) => {
   const n = Number(String(v ?? "").trim());
   return Number.isInteger(n) ? n : NaN;
 };
- 
+
 async function loadJob(db, jobId) {
   const r = await db.query(
     `SELECT j.id, j.job_no AS "jobNo", j.reg_no AS "regNo", j.status, j.current_stage_no AS "stageNo",
@@ -58,27 +58,27 @@ async function loadJob(db, jobId) {
      FROM job j JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`, [jobId]);
   return r.rows[0] || null;
 }
-const reached = (job) => job.status === "IN_PROGRESS" && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
- 
+const reached = (job) => ["IN_PROGRESS", "COMPLETED"].includes(job.status) && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
+
 const sanitize = (b = {}) => ({
   checks: [...new Set((Array.isArray(b.checks) ? b.checks : []).filter((k) => KEYS.includes(k)))],
   answer: b.answer === "YES" || b.answer === "RECHECK" ? b.answer : null,
   note: clean(b.note)?.slice(0, 1000) || null,
 });
- 
+
 async function state(db, jobId) {
   const h = await db.query(`SELECT checks, answer, COALESCE(note, '') AS note, completed_at AS "completedAt" FROM job_delivery_review WHERE job_id = $1`, [jobId]);
   const row = h.rows[0] || { checks: [], answer: null, note: "", completedAt: null };
   return { items: ITEMS.map(([key, label]) => ({ key, label })), header: { ...row, checks: Array.isArray(row.checks) ? row.checks : [] } };
 }
- 
+
 async function save(db, jobId, d, uid) {
   await db.query(
     `INSERT INTO job_delivery_review (job_id, checks, answer, note, saved_by) VALUES ($1, $2::jsonb, $3, $4, $5)
      ON CONFLICT (job_id) DO UPDATE SET checks = EXCLUDED.checks, answer = EXCLUDED.answer, note = EXCLUDED.note, saved_by = EXCLUDED.saved_by, updated_at = CURRENT_TIMESTAMP`,
     [jobId, JSON.stringify(d.checks), d.answer, d.note, uid]);
 }
- 
+
 // GET /jobs/:id/delivery-review
 router.get("/jobs/:id/delivery-review", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -91,7 +91,7 @@ router.get("/jobs/:id/delivery-review", authenticateToken, async (req, res) => {
     return res.json({ job, ...st, reached: reached(job), canRecord: reached(job) && !st.header.completedAt });
   } catch (e) { console.error("load delivery review:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // PUT /jobs/:id/delivery-review   { checks, answer, note }   (save; "Need to recheck" is saved here and the stage stays open)
 router.put("/jobs/:id/delivery-review", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -108,7 +108,7 @@ router.put("/jobs/:id/delivery-review", authenticateToken, async (req, res) => {
     return res.json({ ok: true, ...(await state(pool, jobId)) });
   } catch (e) { console.error("save delivery review:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
- 
+
 // POST /jobs/:id/delivery-review/complete   { checks, answer: "YES" }   every item must be ticked
 router.post("/jobs/:id/delivery-review/complete", authenticateToken, async (req, res) => {
   const jobId = toInt(req.params.id);
@@ -147,6 +147,5 @@ router.post("/jobs/:id/delivery-review/complete", authenticateToken, async (req,
     return res.status(500).json({ message: "Server error" });
   } finally { client.release(); }
 });
- 
+
 module.exports = router;
- 

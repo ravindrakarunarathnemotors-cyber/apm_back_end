@@ -1054,6 +1054,14 @@ async function canOpenJob(req, jobId) {
   return r.rowCount > 0;
 }
 
+// A job whose Job End is done has status COMPLETED, but while a later stage the department uses (Handover / Delivery Review / Free Inspection) is still open,
+// the Jobs tables and counts treat it as IN PROGRESS (the stored status is not changed). Needs the aliases j (job) and d (department).
+const TAIL_OPEN = `(j.status = 'COMPLETED' AND EXISTS (SELECT 1 FROM job_stage ts WHERE ts.job_id = j.id AND ts.status <> 'COMPLETED' AND ts.stage_no IN (
+       CASE WHEN COALESCE((to_jsonb(d)->>'has_handover_check')::boolean, false) THEN (to_jsonb(d)->>'handover_check_stage_no')::int END,
+       CASE WHEN COALESCE((to_jsonb(d)->>'has_delivery_review')::boolean, false) THEN (to_jsonb(d)->>'delivery_review_stage_no')::int END,
+       CASE WHEN COALESCE((to_jsonb(d)->>'has_free_inspection')::boolean, false) THEN (to_jsonb(d)->>'free_inspection_stage_no')::int END)))`;
+const OPEN_NOW = `(j.status = 'IN_PROGRESS' OR ${TAIL_OPEN})`;
+
 // A live job whose current stage has been open longer than this is "overdue" (dashboard badge + Overdue tab)
 const OVERDUE_HOURS = 24;
 const overdueSql = (alias) => `(${alias}.status = 'IN_PROGRESS' AND EXISTS (
@@ -1099,7 +1107,7 @@ const JOB_COLUMNS = `SELECT
                        WHEN COALESCE(d.has_internal_inspection, false) AND j.current_stage_no = d.internal_inspection_stage_no THEN 'Internal Inspection - 1'
                        WHEN COALESCE(d.has_job_activation, false) AND j.current_stage_no = d.job_activation_stage_no THEN 'Job Activation'
                        WHEN COALESCE(d.has_damage_report, false) AND j.current_stage_no = d.damage_report_stage_no THEN 'Vehicle Damages Report' END, m.name)  AS "stageName",
-         j.status,
+         CASE WHEN ${TAIL_OPEN} THEN 'IN_PROGRESS' ELSE j.status END AS status,
          j.created_at                                    AS "createdAt",
          j.updated_at                                    AS "updatedAt",
          j.appointment_date::text                        AS "appointmentDate",
@@ -1137,7 +1145,8 @@ router.get("/jobs", authenticateToken, async (req, res) => {
        ${JOB_FROM}
        WHERE ($1::text IS NULL OR lower(d.name) = lower($1::text))
          AND ($2::int IS NULL OR j.consultant_id = $2::int)
-         AND j.status IS DISTINCT FROM 'CANCELLED'          -- cancelled jobs are not shown on the dashboards (the Jobs page still lists them)
+         AND (CASE WHEN $1::text IS NULL THEN j.status IS DISTINCT FROM 'CANCELLED'
+                   ELSE (j.status NOT IN ('COMPLETED', 'CANCELLED') OR ${TAIL_OPEN}) END)   -- a department dashboard lists the running jobs; Completed / Cancelled come page by page (/jobs/page)
        ORDER BY j.id DESC
        LIMIT 200`,
       [department, own]
@@ -1149,6 +1158,23 @@ router.get("/jobs", authenticateToken, async (req, res) => {
   }
 });
  
+/* ------------------ GET /api/jobs/dept-counts?department=  (tab badges of the department dashboard) ------------------ */
+router.get("/jobs/dept-counts", authenticateToken, async (req, res) => {
+  const department = clean(req.query.department);
+  try {
+    const own = await ownJobsOf(req);
+    const r = await pool.query(
+      `SELECT count(*) FILTER (WHERE j.status NOT IN ('COMPLETED', 'CANCELLED') OR ${TAIL_OPEN})::int AS active,
+              count(*) FILTER (WHERE j.status = 'COMPLETED' AND NOT ${TAIL_OPEN})::int AS completed,
+              count(*) FILTER (WHERE j.status = 'CANCELLED')::int AS cancelled,
+              count(*) FILTER (WHERE j.status = 'IN_PROGRESS' AND j.appointment_date = CURRENT_DATE)::int AS today,
+              count(*) FILTER (WHERE j.status = 'IN_PROGRESS' AND ${overdueSql("j")})::int AS overdue
+         FROM job j LEFT JOIN department d ON d.id = j.department_id
+        WHERE ($1::text IS NULL OR lower(d.name) = lower($1::text)) AND ($2::int IS NULL OR j.consultant_id = $2::int)`, [department, own]);
+    return res.json(r.rows[0]);
+  } catch (error) { console.error("Error loading job counts:", error); return res.status(500).json({ message: "Server error" }); }
+});
+
 /* ------------------ GET /api/jobs/summary (dashboard KPIs, department cards, tab counts) ------------------
    Counts only, computed in SQL -> the dashboards no longer download every job.
    (The newer stage columns are read through to_jsonb(d), so the summary keeps working even before the stage SQL files are run.)
@@ -1158,16 +1184,18 @@ router.get("/jobs/summary", authenticateToken, async (req, res) => {
     const own = await ownJobsOf(req);
     const [tot, deps, stg] = await Promise.all([
       pool.query(`SELECT count(*)::int AS total,
-                         count(*) FILTER (WHERE status = 'IN_PROGRESS')::int AS active,
-                         count(*) FILTER (WHERE status = 'COMPLETED')::int AS done,
-                         count(*) FILTER (WHERE created_at::date = CURRENT_DATE)::int AS today,
-                         count(*) FILTER (WHERE department_id IS NULL)::int AS "noDept",
-                         count(*) FILTER (WHERE ${overdueSql("job")})::int AS overdue
-                  FROM job WHERE ($1::int IS NULL OR consultant_id = $1::int)`, [own]),
+                         count(*) FILTER (WHERE ${OPEN_NOW})::int AS active,
+                         count(*) FILTER (WHERE j.status = 'COMPLETED' AND NOT ${TAIL_OPEN})::int AS done,
+                         count(*) FILTER (WHERE j.status = 'CANCELLED')::int AS cancelled,
+                         count(*) FILTER (WHERE j.appointment_date >= CURRENT_DATE AND j.status <> 'CANCELLED')::int AS appointments,
+                         count(*) FILTER (WHERE j.created_at::date = CURRENT_DATE)::int AS today,
+                         count(*) FILTER (WHERE j.department_id IS NULL)::int AS "noDept",
+                         count(*) FILTER (WHERE ${overdueSql("j")})::int AS overdue
+                  FROM job j LEFT JOIN department d ON d.id = j.department_id WHERE ($1::int IS NULL OR j.consultant_id = $1::int)`, [own]),
       pool.query(`SELECT d.name,
-                         count(j.id) FILTER (WHERE j.status = 'IN_PROGRESS')::int AS active,
-                         count(j.id) FILTER (WHERE j.status = 'COMPLETED')::int AS done,
-                         COALESCE(round(avg(CASE WHEN j.status = 'IN_PROGRESS' AND ms.n > 0 THEN 100.0 * cs.n / ms.n END)), 0)::int AS "avgProgress"
+                         count(j.id) FILTER (WHERE ${OPEN_NOW})::int AS active,
+                         count(j.id) FILTER (WHERE j.status = 'COMPLETED' AND NOT ${TAIL_OPEN})::int AS done,
+                         COALESCE(round(avg(CASE WHEN ${OPEN_NOW} AND ms.n > 0 THEN 100.0 * cs.n / ms.n END)), 0)::int AS "avgProgress"
                   FROM department d
                   LEFT JOIN job j ON j.department_id = d.id AND ($1::int IS NULL OR j.consultant_id = $1::int)
                   LEFT JOIN LATERAL (SELECT count(*) AS n FROM job_stage s WHERE s.job_id = j.id AND s.status = 'COMPLETED') cs ON true
@@ -1192,7 +1220,7 @@ router.get("/jobs/summary", authenticateToken, async (req, res) => {
                          count(*)::int AS n
                   FROM job j JOIN department d ON d.id = j.department_id
                   LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no
-                  WHERE j.status = 'IN_PROGRESS' AND ($1::int IS NULL OR j.consultant_id = $1::int)
+                  WHERE ${OPEN_NOW} AND ($1::int IS NULL OR j.consultant_id = $1::int)
                   GROUP BY d.name, j.current_stage_no, 3 ORDER BY j.current_stage_no`, [own]),
     ]);
     const departments = deps.rows.map((d) => ({ ...d, stages: stg.rows.filter((x) => x.dept === d.name).map(({ stageNo, stageName, n }) => ({ stageNo, stageName, n })) }));
@@ -1208,20 +1236,25 @@ router.get("/jobs/summary", authenticateToken, async (req, res) => {
    department = a name, or "__none__" for jobs without a department yet
    -> { rows, total, page, pageSize, filters: { consultants, departments, stages } }
    Must stay ABOVE GET /jobs/:id. */
+const JOB_FILTER_CACHE = new Map(); // key: consultant scope -> { at, v: [consultants, departments, stages] }
+const dateOf = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null);   // yyyy-mm-dd or null
 router.get("/jobs/page", authenticateToken, async (req, res) => {
-  const pageSize = [10, 25, 50, 100].includes(toInt(req.query.pageSize)) ? toInt(req.query.pageSize) : 10;
+  const pageSize = [10, 25].includes(toInt(req.query.pageSize)) ? toInt(req.query.pageSize) : 10;   // the server decides: 10 (default) or 25 rows per page, never more
   const search = (clean(req.query.search) || "").toLowerCase().replace(/[\s-]/g, "");
   const consultant = clean(req.query.consultant);
   const department = clean(req.query.department);
   const stage = toInt(req.query.stage);
   const status = ["IN_PROGRESS", "COMPLETED", "CANCELLED", "TODAY"].includes(req.query.status) ? req.query.status : null;   // dashboard KPI filter
   const appointment = ["ANY", "TODAY", "UPCOMING", "PAST", "NONE"].includes(req.query.appointment) ? req.query.appointment : null;
+  const dateCol = req.query.dateBy === "appointment" ? "j.appointment_date" : "j.created_at::date";   // what From / To filter on
+  const order = req.query.sort === "appt_asc" ? "j.appointment_date ASC NULLS LAST, j.appointment_time ASC NULLS LAST, j.id DESC"
+              : req.query.sort === "appt_desc" ? "j.appointment_date DESC NULLS LAST, j.appointment_time DESC NULLS LAST, j.id DESC" : "j.id DESC";
   const where = `
        WHERE ($1::text = '' OR replace(replace(lower(concat_ws(' ', j.job_no, c.customer_name, c.contact_number, j.reg_no, u.first_name, u.last_name, j.sales_officer)), ' ', ''), '-', '') LIKE '%' || $1::text || '%')
          AND ($2::text IS NULL OR trim(concat(u.first_name, ' ', u.last_name)) = $2::text)
          AND ($3::text IS NULL OR (lower($3::text) = '__none__' AND d.id IS NULL) OR lower(d.name) = lower($3::text))
          AND ($4::int IS NULL OR j.current_stage_no = $4::int)
-         AND ($5::text IS NULL OR ($5::text = 'TODAY' AND j.created_at::date = CURRENT_DATE) OR j.status = $5::text)
+         AND ($5::text IS NULL OR ($5::text = 'TODAY' AND j.created_at::date = CURRENT_DATE) OR ($5::text = 'IN_PROGRESS' AND ${OPEN_NOW}) OR ($5::text = 'COMPLETED' AND j.status = 'COMPLETED' AND NOT ${TAIL_OPEN}) OR ($5::text = 'CANCELLED' AND j.status = 'CANCELLED'))
          AND ($6::text IS NULL
               OR ($6::text = 'ANY'      AND j.appointment_date IS NOT NULL)
               OR ($6::text = 'TODAY'    AND j.appointment_date = CURRENT_DATE)
@@ -1229,22 +1262,29 @@ router.get("/jobs/page", authenticateToken, async (req, res) => {
               OR ($6::text = 'PAST'     AND j.appointment_date < CURRENT_DATE)
               OR ($6::text = 'NONE'     AND j.appointment_date IS NULL))
          AND ($7::int IS NULL OR j.consultant_id = $7::int)
-         AND ($8::boolean IS NOT TRUE OR ${overdueSql("j")})`;
+         AND ($8::boolean IS NOT TRUE OR ${overdueSql("j")})
+         AND ($9::date IS NULL OR ${dateCol} >= $9::date)
+         AND ($10::date IS NULL OR ${dateCol} <= $10::date)`;   // NOTE: no SQL "--" comment inside this string: ORDER BY / LIMIT are appended to it on the same line
   try {
     const own = await ownJobsOf(req);
-    const params = [search, consultant, department, Number.isInteger(stage) ? stage : null, status, appointment, own, req.query.overdue === "1"];
+    const params = [search, consultant, department, Number.isInteger(stage) ? stage : null, status, appointment, own, req.query.overdue === "1", dateOf(req.query.from), dateOf(req.query.to)];
     const count = await pool.query(`SELECT count(*)::int AS n ${JOB_FROM} ${where}`, params);
     const total = count.rows[0].n;
     const pages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(Math.max(toInt(req.query.page) || 1, 1), pages);
-    const [rows, cons, deps, stages] = await Promise.all([
-      pool.query(`${JOB_COLUMNS} ${JOB_FROM} ${where} ORDER BY j.id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, params),
-      pool.query(`SELECT DISTINCT trim(concat(u.first_name, ' ', u.last_name)) AS name FROM job j JOIN admin_user u ON u.id = j.consultant_id WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
-      pool.query(`SELECT DISTINCT d.name FROM job j JOIN department d ON d.id = j.department_id WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
-      pool.query(`SELECT DISTINCT j.current_stage_no AS "stageNo", m.name AS "stageName" FROM job j LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
+    // the three filter lists scan the whole job table: cached for 60 s (per consultant scope), not recomputed on every page click
+    const fk = String(own ?? "all"), hit = JOB_FILTER_CACHE.get(fk);
+    const [rows, lists] = await Promise.all([
+      pool.query(`${JOB_COLUMNS} ${JOB_FROM} ${where} ORDER BY ${order} LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, params),
+      hit && Date.now() - hit.at < 60000 ? hit.v : Promise.all([
+        pool.query(`SELECT DISTINCT trim(concat(u.first_name, ' ', u.last_name)) AS name FROM job j JOIN admin_user u ON u.id = j.consultant_id WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
+        pool.query(`SELECT DISTINCT d.name FROM job j JOIN department d ON d.id = j.department_id WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
+        pool.query(`SELECT DISTINCT j.current_stage_no AS "stageNo", m.name AS "stageName" FROM job j LEFT JOIN job_stage_master m ON m.stage_no = j.current_stage_no WHERE ($1::int IS NULL OR j.consultant_id = $1::int) ORDER BY 1`, [own]),
+      ]).then((v) => { JOB_FILTER_CACHE.set(fk, { at: Date.now(), v }); return v; }),
     ]);
+    const [cons, deps, stages] = lists;
     return res.json({
-      rows: rows.rows, total, page, pageSize, overdueHours: OVERDUE_HOURS, scope: own === null ? "all" : "own",
+      rows: rows.rows.slice(0, pageSize), total, page, pageSize, overdueHours: OVERDUE_HOURS, scope: own === null ? "all" : "own",
       filters: { consultants: cons.rows.map((r) => r.name).filter(Boolean), departments: deps.rows.map((r) => r.name), stages: stages.rows },
     });
   } catch (error) {
@@ -1538,14 +1578,14 @@ router.get("/jobs/:id/stage-details", authenticateToken, async (req, res) => {
       q(`SELECT test_run AS "testRun", faults_found AS "faultsFound", previous_repair AS "previousRepair", new_repair AS "newRepair", warranty,
                 history_remarks AS "historyRemarks", repair_types AS "repairTypes", signed_by_name AS "signedBy", signed_at AS "signedAt" FROM job_inspection WHERE job_id = $1`),
       q(`SELECT kind, description FROM job_inspection_item WHERE job_id = $1 ORDER BY kind, sort_order, id`),
-      q(`SELECT description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", status, COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_repair_item WHERE job_id = $1 ORDER BY id`),
+      q(`SELECT description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", status, COALESCE(warranty_claim, false) AS "warrantyClaim", markup_percent::float AS "markupPercent" FROM job_repair_item WHERE job_id = $1 ORDER BY id`),
       q(`SELECT file_name AS name, file_url AS url, mime_type AS mime FROM job_inspection_file WHERE job_id = $1 ORDER BY id LIMIT 40`),
       q(`SELECT no_parts_needed AS "noParts", link_sent_at AS "linkSentAt", completed_at AS "completedAt" FROM job_spare_parts WHERE job_id = $1`),
-      q(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", stock_status AS "stock", price_source AS "source", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part WHERE job_id = $1 ORDER BY id`),
+      q(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", stock_status AS "stock", price_source AS "source", COALESCE(warranty_claim, false) AS "warrantyClaim", markup_percent::float AS "markupPercent" FROM job_spare_part WHERE job_id = $1 ORDER BY id`),
       q(`SELECT description, quoted_price::float AS "quotedPrice" FROM job_spare_quote WHERE job_id = $1 ORDER BY id`),
       q(`SELECT est_hours::float AS "estHours", est_days::float AS "estDays", include_spare_parts AS "includeSpareParts", include_labour AS "includeLabour",
                 manual_items AS "manualItems", wash_items AS "washItems", estimated_total::float AS "estimatedTotal", sent_via AS "sentVia", decision,
-                agreed_scope AS "agreedScope", extra_note AS "extraNote", parts_by AS "partsBy", COALESCE(client_parts, '[]'::jsonb) AS "clientParts", repair_request_sent_at AS "repairRequestSentAt",
+                agreed_scope AS "agreedScope", extra_note AS "extraNote", parts_by AS "partsBy", COALESCE(client_parts, '[]'::jsonb) AS "clientParts", COALESCE(unused_parts, '[]'::jsonb) AS "unusedParts", repair_request_sent_at AS "repairRequestSentAt",
                 third_party_request AS "thirdPartyRequest", third_party_note AS "thirdPartyNote", completed_at AS "completedAt"
            FROM job_customer_approval WHERE job_id = $1`),
       q(`SELECT notes, logistics_reminder_at AS "logisticsReminderAt", customer_reminder_at AS "customerReminderAt", completed_at AS "completedAt" FROM job_internal_inspection WHERE job_id = $1`),
@@ -1568,8 +1608,9 @@ router.get("/jobs/:id/stage-details", authenticateToken, async (req, res) => {
     if (a) {
       // by what the customer agreed: "Agreed scope only" counts only the ticked repair items; the spare parts the customer brings are not charged
       const own = (a.clientParts || []).map(Number);
+      const unusedIds = (a.unusedParts || []).map(Number);   // "Not used" items of the Spare Parts Provided by list
       const labLines = inspRepairs.rows.filter((x) => x.status === "ACTIVE" && !x.warrantyClaim && (a.decision !== "PARTIAL" || (a.agreedScope || []).includes(x.repairType || x.description)));
-      const partLines = parts.filter((x) => !x.warrantyClaim && !(a.partsBy === "CLIENT" && own.includes(Number(x.id))));
+      const partLines = parts.filter((x) => !x.warrantyClaim && !(a.partsBy === "CLIENT" && (own.includes(Number(x.id)) || unusedIds.includes(Number(x.id)))));
       const spare = a.includeSpareParts ? partLines.reduce((t, x) => t + x.qty * x.unitPrice, 0) + quotes.reduce((t, x) => t + x.quotedPrice, 0) : 0;
       const labour = a.includeLabour ? labLines.reduce((t, x) => t + (x.amount || 0), 0) : 0;
       const manual = (a.manualItems || []).reduce((t, m) => t + (Number(m.amount) || 0), 0);
@@ -1580,8 +1621,8 @@ router.get("/jobs/:id/stage-details", authenticateToken, async (req, res) => {
       // the % is added to the UNIT PRICE of each line: markup of a line = qty x (unit price + % - unit price)
       const lineAdj = (q, u, pc = markupPercent) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + pc)) / 100 - (Number(u) || 0)) * 100) / 100;
       const markup = Math.round((
-        (a.includeSpareParts ? partLines.reduce((s, x) => s + lineAdj(x.qty, x.unitPrice, sparePercent), 0) + quotes.reduce((s, x) => s + lineAdj(1, x.quotedPrice, sparePercent), 0) : 0)
-        + (a.includeLabour ? labLines.reduce((s, x) => s + lineAdj(x.qty || 1, x.unitPrice ?? x.amount), 0) : 0)
+        (a.includeSpareParts ? partLines.reduce((s, x) => s + lineAdj(x.qty, x.unitPrice, x.markupPercent ?? sparePercent), 0) + quotes.reduce((s, x) => s + lineAdj(1, x.quotedPrice, sparePercent), 0) : 0)
+        + (a.includeLabour ? labLines.reduce((s, x) => s + lineAdj(x.qty || 1, x.unitPrice ?? x.amount, x.markupPercent ?? markupPercent), 0) : 0)
         + (a.manualItems || []).reduce((s, m) => s + lineAdj(1, m.amount), 0)
       ) * 100) / 100;
       estimate = { ...a, spare, labour, manual, wash, markup, markupPercent, sparePercent, total: Math.round((spare + labour + manual + markup + wash) * 100) / 100 };

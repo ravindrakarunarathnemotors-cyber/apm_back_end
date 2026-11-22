@@ -25,11 +25,14 @@ dayjs.extend(timezone);
 
 const router = express.Router();
 pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});
+pool.query("ALTER TABLE job_repair_item ADD COLUMN IF NOT EXISTS is_manual boolean NOT NULL DEFAULT false").catch(() => {});
+pool.query("ALTER TABLE job_repair_item ADD COLUMN IF NOT EXISTS markup_percent numeric(6,2)").catch(() => {});
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS markup_percent numeric(6,2)").catch(() => {});
 pool.query("ALTER TABLE job_spare_quote ADD COLUMN IF NOT EXISTS extra_scope_id integer, ADD COLUMN IF NOT EXISTS extra_item_id text").catch(() => {});   // lines of the Extra Job Scope carry extra_scope_id; this stage shows only its own lines
 
  
 // Adds the columns of the "customer brings the spare parts" report by itself (so no SQL file has to be run by hand)
-pool.query("ALTER TABLE job_customer_approval ADD COLUMN IF NOT EXISTS client_parts jsonb NOT NULL DEFAULT '[]'::jsonb, ADD COLUMN IF NOT EXISTS client_parts_token text")
+pool.query("ALTER TABLE job_customer_approval ADD COLUMN IF NOT EXISTS client_parts jsonb NOT NULL DEFAULT '[]'::jsonb, ADD COLUMN IF NOT EXISTS client_parts_token text, ADD COLUMN IF NOT EXISTS unused_parts jsonb NOT NULL DEFAULT '[]'::jsonb")
   .catch((e) => console.error("customer approval: could not add the client_parts columns (run add_client_parts.sql):", e.code, e.message));
  
 // the estimate page the customer opens from the SMS link (the document is saved when the SMS is sent)
@@ -95,9 +98,9 @@ const reached = (job) => job.status === "IN_PROGRESS" && job.hasApproval && job.
 // Everything this stage shows from the earlier stages
 async function context(db, jobId) {
   const [parts, quotes, repairs, causes, wash, mk, treeRows] = await Promise.all([
-    db.query(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
+    db.query(`SELECT id, name, brand, quality, qty, unit_price::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim", (part_id IS NULL) AS manual, markup_percent::float AS "markupPercent" FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
     db.query(`SELECT id, description, quoted_price::float AS "quotedPrice" FROM job_spare_quote WHERE job_id = $1 AND quoted_price IS NOT NULL AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
-    db.query(`SELECT description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_repair_item WHERE job_id = $1 AND status = 'ACTIVE' ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
+    db.query(`SELECT description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty, COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", COALESCE(warranty_claim, false) AS "warrantyClaim", COALESCE(is_manual, false) AS manual, markup_percent::float AS "markupPercent" FROM job_repair_item WHERE job_id = $1 AND status = 'ACTIVE' ORDER BY id`, [jobId]).catch(() => ({ rows: [] })),
     db.query(`SELECT description FROM job_inspection_item WHERE job_id = $1 AND kind = 'ROOT_CAUSE' ORDER BY sort_order, id`, [jobId]).catch(() => ({ rows: [] })),
     // Wash types + prices come from the Wash department's "Wash Type" / "Repair Type" list (Jobs Dashboard > Repair Type)
     db.query(
@@ -133,8 +136,10 @@ async function context(db, jobId) {
   const washOptions = all
     .filter((o) => o.groupName || !parentsWithKids.has(o.name.toLowerCase()))
     .map((o) => ({ id: o.id, name: o.name, group: o.groupName, price: o.price || 0 }));
+  // every third-party quotation item of the job (also the ones still waiting for a price): the "Spare Parts Provided by" list lets the user pick any of them
+  const allQuotes = (await db.query(`SELECT id, description, quoted_price::float AS "quotedPrice" FROM job_spare_quote WHERE job_id = $1 AND extra_scope_id IS NULL ORDER BY id`, [jobId]).catch(() => ({ rows: [] }))).rows;
   return {
-    parts: parts.rows, quotes: quotes.rows, sparePartsValue: Math.round(sparePartsValue * 100) / 100,
+    parts: parts.rows, quotes: quotes.rows, allQuotes, sparePartsValue: Math.round(sparePartsValue * 100) / 100,
     labour: repairs.rows, labourTotal: Math.round(labourTotal * 100) / 100,
     rootCauses: causes.rows.map((r) => r.description), washOptions, repairTree, markupPercent: mk.rows[0]?.p || 0, sparePercent: mk.rows[0]?.sp ?? (mk.rows[0]?.p || 0),
   };
@@ -142,7 +147,7 @@ async function context(db, jobId) {
  
 const EMPTY = {
   estHours: null, estDays: null, includeSpareParts: true, includeLabour: true, manualItems: [], washItems: [], estimatedTotal: 0,
-  sentVia: [], decision: null, agreedScope: [], extraNote: "", partsBy: null, clientPartsFiles: [], clientParts: [], clientListSentAt: null,
+  sentVia: [], decision: null, agreedScope: [], extraNote: "", partsBy: null, clientPartsFiles: [], clientParts: [], unusedParts: [], clientListSentAt: null,
   repairRequestSentAt: null, thirdPartyRequest: false, thirdPartyNote: "", thirdPartySentAt: null, completedAt: null,
 };
 async function loadSaved(db, jobId) {
@@ -150,7 +155,7 @@ async function loadSaved(db, jobId) {
     `SELECT est_hours::float AS "estHours", est_days::float AS "estDays", include_spare_parts AS "includeSpareParts", include_labour AS "includeLabour",
             manual_items AS "manualItems", wash_items AS "washItems", estimated_total::float AS "estimatedTotal", sent_via AS "sentVia",
             decision, agreed_scope AS "agreedScope", COALESCE(extra_note, '') AS "extraNote", parts_by AS "partsBy",
-            client_parts_files AS "clientPartsFiles", COALESCE(client_parts, '[]'::jsonb) AS "clientParts", client_list_sent_at AS "clientListSentAt",
+            client_parts_files AS "clientPartsFiles", COALESCE(client_parts, '[]'::jsonb) AS "clientParts", COALESCE(unused_parts, '[]'::jsonb) AS "unusedParts", client_list_sent_at AS "clientListSentAt",
             repair_request_sent_at AS "repairRequestSentAt", third_party_request AS "thirdPartyRequest", COALESCE(third_party_note, '') AS "thirdPartyNote",
             third_party_sent_at AS "thirdPartySentAt", completed_at AS "completedAt"
      FROM job_customer_approval WHERE job_id = $1`, [jobId]);
@@ -164,9 +169,10 @@ function billable(saved, ctx) {
   const agreed = Array.isArray(saved.agreedScope) ? saved.agreedScope : [];
   const own = Array.isArray(saved.clientParts) ? saved.clientParts.map(Number) : [];
   const labour = ctx.labour.filter((l) => !l.warrantyClaim && (saved.decision !== "PARTIAL" || agreed.includes(scopeKey(l))));
-  const parts = ctx.parts.filter((p) => !p.warrantyClaim && !(saved.partsBy === "CLIENT" && own.includes(Number(p.id))));
+  const unused = Array.isArray(saved.unusedParts) ? saved.unusedParts.map(Number) : [];   // "Not used" items (only while the customer provides parts)
+  const parts = ctx.parts.filter((p) => !p.warrantyClaim && !(saved.partsBy === "CLIENT" && (own.includes(Number(p.id)) || unused.includes(Number(p.id)))));
   // third-party items the customer brings himself are saved as the negative number of the quotation id
-  const quotes = ctx.quotes.filter((q) => !(saved.partsBy === "CLIENT" && own.includes(-Number(q.id))));
+  const quotes = ctx.quotes.filter((q) => !(saved.partsBy === "CLIENT" && (own.includes(-Number(q.id)) || unused.includes(-Number(q.id)))));
   return { labour, parts, quotes };
 }
 function totals(saved, ctx) {
@@ -183,9 +189,9 @@ function totals(saved, ctx) {
   // the % is added to the UNIT PRICE of each line: markup of a line = qty x (unit price + % - unit price)
   const lineAdj = (q, u, pc = pct) => Math.round((Number(q) || 0) * (Math.round((Number(u) || 0) * (100 + pc)) / 100 - (Number(u) || 0)) * 100) / 100;
   let markup = 0;
-  if (saved.includeSpareParts) markup += partLines.reduce((s, r) => s + lineAdj(r.qty, r.unitPrice, spct), 0);
+  if (saved.includeSpareParts) markup += partLines.reduce((s, r) => s + lineAdj(r.qty, r.unitPrice, r.markupPercent ?? spct), 0);   // a line with its own % uses it
   if (inclQ) markup += quoteLines.reduce((s, q) => s + lineAdj(1, q.quotedPrice, spct), 0);
-  if (saved.includeLabour) markup += labourLines.reduce((s, r) => s + lineAdj(r.qty || 1, r.unitPrice ?? r.amount), 0);
+  if (saved.includeLabour) markup += labourLines.reduce((s, r) => s + lineAdj(r.qty || 1, r.unitPrice ?? r.amount, r.markupPercent ?? pct), 0);
   markup += saved.manualItems.reduce((s, m) => s + lineAdj(1, m.amount), 0);
   markup = Math.round(markup * 100) / 100;
   return { spare, labour, manual, repairCost, markup, markupPercent: Number(ctx.markupPercent) || 0, sparePercent: Number(ctx.sparePercent ?? ctx.markupPercent) || 0, wash, total: Math.round((spare + repairCost + markup + wash) * 100) / 100 };
@@ -245,28 +251,30 @@ router.put("/jobs/:id/customer-approval", authenticateToken, async (req, res) =>
       .map((f) => ({ url: clean(f?.url)?.slice(0, 500), name: clean(f?.name)?.slice(0, 200) || "Spare part list" })).filter((f) => f.url);
     // the spare parts the customer brings (ids of this job's spare parts)
     // (a third-party quotation item the customer brings is the negative number of its id)
-    const partIds = new Set([...ctx.parts.map((p) => p.id), ...ctx.quotes.map((q) => -q.id)]);
+    const partIds = new Set([...ctx.parts.map((p) => p.id), ...(ctx.allQuotes || ctx.quotes).map((q) => -q.id)]);
     const clientParts = [...new Set((Array.isArray(b.clientParts) ? b.clientParts : []).map(Number).filter((n) => Number.isInteger(n) && partIds.has(n)))];
+    // spare parts / third-party items that are NOT USED in this job (not charged, not supplied); a part is either brought by the customer or not used
+    const unusedParts = [...new Set((Array.isArray(b.unusedParts) ? b.unusedParts : []).map(Number).filter((n) => Number.isInteger(n) && partIds.has(n) && !clientParts.includes(n)))];
     const next = {
       ...g.saved, includeSpareParts: b.includeSpareParts !== false, includeLabour: b.includeLabour !== false, manualItems, washItems,
-      decision, agreedScope: decision === "PARTIAL" ? lines(b.agreedScope) : [], partsBy, clientParts,
+      decision, agreedScope: decision === "PARTIAL" ? lines(b.agreedScope) : [], partsBy, clientParts, unusedParts,
     };
     const t = totals(next, ctx);
     await pool.query(
       `INSERT INTO job_customer_approval
          (job_id, est_hours, est_days, include_spare_parts, include_labour, manual_items, wash_items, estimated_total, sent_via,
-          decision, agreed_scope, extra_note, parts_by, client_parts_files, third_party_request, third_party_note, saved_by, client_parts)
-       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18::jsonb)
+          decision, agreed_scope, extra_note, parts_by, client_parts_files, third_party_request, third_party_note, saved_by, client_parts, unused_parts)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18::jsonb,$19::jsonb)
        ON CONFLICT (job_id) DO UPDATE SET
          est_hours = EXCLUDED.est_hours, est_days = EXCLUDED.est_days, include_spare_parts = EXCLUDED.include_spare_parts,
          include_labour = EXCLUDED.include_labour, manual_items = EXCLUDED.manual_items, wash_items = EXCLUDED.wash_items,
          estimated_total = EXCLUDED.estimated_total, sent_via = EXCLUDED.sent_via, decision = EXCLUDED.decision,
          agreed_scope = EXCLUDED.agreed_scope, extra_note = EXCLUDED.extra_note, parts_by = EXCLUDED.parts_by,
          client_parts_files = EXCLUDED.client_parts_files, third_party_request = EXCLUDED.third_party_request,
-         third_party_note = EXCLUDED.third_party_note, saved_by = EXCLUDED.saved_by, client_parts = EXCLUDED.client_parts, updated_at = CURRENT_TIMESTAMP`,
+         third_party_note = EXCLUDED.third_party_note, saved_by = EXCLUDED.saved_by, client_parts = EXCLUDED.client_parts, unused_parts = EXCLUDED.unused_parts, updated_at = CURRENT_TIMESTAMP`,
       [g.jobId, estHours, estDays, next.includeSpareParts, next.includeLabour, JSON.stringify(manualItems), JSON.stringify(washItems), t.total, sentVia,
        decision, decision === "PARTIAL" ? lines(b.agreedScope) : [], clean(b.extraNote)?.slice(0, 1000) || null, partsBy, JSON.stringify(files),
-       b.thirdPartyRequest === true, clean(b.thirdPartyNote)?.slice(0, 500) || null, currentUserId(req), JSON.stringify(clientParts)]);
+       b.thirdPartyRequest === true, clean(b.thirdPartyNote)?.slice(0, 500) || null, currentUserId(req), JSON.stringify(clientParts), JSON.stringify(unusedParts)]);
     const saved = await loadSaved(pool, g.jobId);
     return res.json({ saved, totals: totals(saved, ctx) });
   } catch (e) {
@@ -472,7 +480,7 @@ async function clientPartsCount(jobId, saved) {
   return r.rows[0]?.n || 0;
 }
 // Bell notification + push to everybody with the Inventory & Spare Parts privilege
-async function pushInventoryReminder(job, jobId, n) {
+async function pushInventoryReminder(job, jobId, n, opts = {}) {
   if (!sendPushToUser) throw Object.assign(new Error("The notification service was not found on the server"), { status: 500 });
   const envIds = String(process.env.INVENTORY_MENU_IDS || "").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x) && Number(x) > 0).map(Number);
   const menu = envIds.length
@@ -486,7 +494,7 @@ async function pushInventoryReminder(job, jobId, n) {
     `SELECT DISTINCT u.id FROM admin_user u JOIN admin_role r ON r.id = u.role_id
       WHERE r.privileges::text[] && $1::text[] AND COALESCE(r.status, 'active') = 'active'`, [ids.map(String)]);
   for (const u of users.rows) {
-    await sendPushToUser(u.id, { title: "Reminder · spare parts", body: `${job.jobNo} · ${job.regNo}: ${n > 0 ? `${n} part${n === 1 ? "" : "s"} - ` : ""}please prepare the spare parts (${job.departmentName || "-"})`, url });
+    await sendPushToUser(u.id, { title: opts.title || "Reminder · spare parts", body: opts.body || `${job.jobNo} · ${job.regNo}: ${n > 0 ? `${n} part${n === 1 ? "" : "s"} - ` : ""}please prepare the spare parts (${job.departmentName || "-"})`, url });
   }
   return users.rowCount;
 }
@@ -617,6 +625,15 @@ router.post("/jobs/:id/customer-approval/complete", authenticateToken, async (re
       stageNo = next;
     }
     await client.query("COMMIT");
+    // the approval is done: tell Inventory & Spare Parts to issue the spare parts WE provide (nothing is sent when the customer brings all of them / they are not used)
+    (async () => {
+      try {
+        const skip = s.partsBy === "CLIENT" ? [...(s.clientParts || []), ...(s.unusedParts || [])].map(Number).filter((x) => Number.isInteger(x) && x > 0) : [];
+        const c = await pool.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL AND id <> ALL($2::int[])", [jobId, skip]);
+        const n = c.rows[0]?.n || 0;
+        if (n > 0) await pushInventoryReminder(job, jobId, n, { title: "Issue spare parts", body: `${job.jobNo} · ${job.regNo}: the customer approved the estimate - please issue ${n} spare part${n === 1 ? "" : "s"} (${job.departmentName || "-"})` });
+      } catch (e) { console.error("approval complete: inventory notification:", e.message); }
+    })();
     // the invoice is created from the approved statement (a problem here must not undo the completed stage; the invoice is also created when it is opened)
     try {
       let inv;

@@ -84,9 +84,12 @@ async function recordRights(req, job, signed) {
   return { canRecord: reached && editRole, reached, locked: reached && signed && !editRole };
 }
 
+pool.query("ALTER TABLE job_repair_item ADD COLUMN IF NOT EXISTS markup_percent numeric(6,2)").catch((e) => console.error("markup_percent ddl:", e.message));   // price adjustment of THIS line (NULL = the job's repair adjustment)
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS markup_percent numeric(6,2)").catch(() => {});
+pool.query("ALTER TABLE job_repair_item ADD COLUMN IF NOT EXISTS is_manual boolean NOT NULL DEFAULT false").catch((e) => console.error("is_manual ddl:", e.message));   // typed in by hand (not ticked from the repair type list)
 const ITEM_SELECT = `SELECT id, description, repair_type AS "repairType", amount::float AS amount, COALESCE(qty, 1) AS qty,
                             COALESCE(unit_price, amount / GREATEST(COALESCE(qty, 1), 1))::float AS "unitPrice", status,
-                            replaces_item_id AS "replacesItemId", changed_at AS "changedAt", COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_repair_item`;
+                            replaces_item_id AS "replacesItemId", changed_at AS "changedAt", COALESCE(warranty_claim, false) AS "warrantyClaim", COALESCE(is_manual, false) AS "isManual", markup_percent::float AS "markupPercent" FROM job_repair_item`;
 
 async function loadAll(db, job) {
   const jobId = job.id;
@@ -239,6 +242,7 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
 
     // The spare parts are recorded in this same window (departments whose spare parts stage follows the inspection stage).
     // Signing therefore needs the spare parts list (or "No spare parts needed") and completes the spare parts stage too.
+    let autoSend = null;   // set when the spare parts were sent to Inventory automatically while signing
     const mergeSpare = Boolean(complete && job.hasSpareParts && job.stageNo === job.inspectionStageNo && job.spareStageNo === job.inspectionStageNo + 1);
     if (mergeSpare) {
       const sp = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_part WHERE job_id = $1 AND extra_scope_id IS NULL", [jobId]);
@@ -250,7 +254,14 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
           `SELECT (SELECT link_sent_at FROM job_spare_parts WHERE job_id = $1) IS NOT NULL AS sent,
                   EXISTS (SELECT 1 FROM job_spare_quote WHERE job_id = $1 AND status = 'REQUESTED' AND extra_scope_id IS NULL) AS "newQuotes",
                   COALESCE((SELECT updated_at > link_sent_at FROM job_spare_parts WHERE job_id = $1), false) AS changed`, [jobId]);
-        if (!up.rows[0].sent || up.rows[0].newQuotes || up.rows[0].changed) { await client.query("ROLLBACK"); return res.status(409).json({ message: "First upload to Inventory: press \"Upload to ERP System\" in the spare parts section, then complete the inspection." }); }
+        if (!up.rows[0].sent || up.rows[0].newQuotes || up.rows[0].changed) {
+          // not sent to Inventory & Spare Parts yet (or changed since): signing sends it automatically, the same as "Send both lists"
+          await client.query("INSERT INTO job_spare_parts (job_id, saved_by) VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING", [jobId, currentUserId(req)]);
+          await client.query("UPDATE job_spare_parts SET link_token = COALESCE(link_token, $2), link_sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE job_id = $1", [jobId, require("node:crypto").randomBytes(24).toString("hex")]);
+          await client.query("UPDATE job_spare_quote SET status = 'SENT' WHERE job_id = $1 AND status = 'REQUESTED' AND extra_scope_id IS NULL", [jobId]);
+          const nq = await client.query("SELECT COUNT(*)::int AS n FROM job_spare_quote WHERE job_id = $1 AND status = 'SENT' AND extra_scope_id IS NULL", [jobId]);
+          autoSend = { job, nParts: sp.rows[0].n, nQuotes: nq.rows[0].n };
+        }
       }
     }
 
@@ -302,7 +313,13 @@ router.put("/jobs/:id/inspection", authenticateToken, async (req, res) => {
     }
     await client.query("UPDATE job SET updated_at = CURRENT_TIMESTAMP WHERE id = $1", [jobId]);
     await client.query("COMMIT");
-    return res.json({ message: complete ? "Job inspection signed" : "Job inspection saved", currentStageNo: stageNo, stageCompleted: stageNo !== job.stageNo, spareCompleted });
+    if (autoSend) {   // push notification to Inventory & Spare Parts (fire and forget), same as the "Send both lists" button
+      for (const m of ["./spare", "./spare_parts.routes"]) {
+        try { const r = require(m); if (typeof r.notifyInventory === "function") { r.notifyInventory(autoSend.job, autoSend.nParts, autoSend.nQuotes, userId); break; } }
+        catch (e) { if (e.code !== "MODULE_NOT_FOUND") { console.error("auto send notification:", e.message); break; } }
+      }
+    }
+    return res.json({ message: complete ? "Job inspection signed" : "Job inspection saved", currentStageNo: stageNo, stageCompleted: stageNo !== job.stageNo, spareCompleted, spareAutoSent: Boolean(autoSend) });
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch (_) { /* ignore */ }
     console.error("Error saving the job inspection:", error.code, error.message);
@@ -350,7 +367,7 @@ router.post("/jobs/:id/inspection/repair-items", authenticateToken, async (req, 
   try {
     const g = await guard(req, res); if (!g) return;
     const v = readItem(req.body); if (v.error) return res.status(400).json({ message: v.error });
-    await pool.query("INSERT INTO job_repair_item (job_id, description, repair_type, qty, unit_price, amount, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)", [g.jobId, v.description, v.repairType, v.qty, v.unitPrice, v.amount, currentUserId(req)]);
+    await pool.query("INSERT INTO job_repair_item (job_id, description, repair_type, qty, unit_price, amount, created_by, is_manual) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", [g.jobId, v.description, v.repairType, v.qty, v.unitPrice, v.amount, currentUserId(req), req.body?.manual === true]);
     return res.status(201).json(await repairList(g.jobId));
   } catch (e) { console.error("add repair item:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
@@ -365,9 +382,28 @@ router.put("/jobs/:id/inspection/repair-items/:itemId", authenticateToken, async
     const uid = currentUserId(req);
     const upd = await pool.query("UPDATE job_repair_item SET status = 'ALTERNATED', changed_by = $3, changed_at = CURRENT_TIMESTAMP WHERE id = $1 AND job_id = $2 AND status = 'ACTIVE' RETURNING id", [itemId, g.jobId, uid]);
     if (upd.rowCount === 0) return res.status(404).json({ message: "Repair item not found" });
-    await pool.query("INSERT INTO job_repair_item (job_id, description, repair_type, qty, unit_price, amount, replaces_item_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", [g.jobId, v.description, v.repairType, v.qty, v.unitPrice, v.amount, itemId, uid]);
+    await pool.query("INSERT INTO job_repair_item (job_id, description, repair_type, qty, unit_price, amount, replaces_item_id, created_by, is_manual, markup_percent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE((SELECT is_manual FROM job_repair_item WHERE id = $7), false), (SELECT markup_percent FROM job_repair_item WHERE id = $7))", [g.jobId, v.description, v.repairType, v.qty, v.unitPrice, v.amount, itemId, uid]);
     return res.json(await repairList(g.jobId));
   } catch (e) { console.error("alternate repair item:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+});
+
+// PUT /jobs/:id/inspection/repair-items/:itemId/markup   { percent }   -> price adjustment of ONE repair line (null = follow the job's repair adjustment)
+router.put("/jobs/:id/inspection/repair-items/:itemId/markup", authenticateToken, async (req, res) => {
+  const itemId = toInt(req.params.itemId);
+  if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
+  const raw = req.body?.percent;
+  const same = raw === null || raw === "same" || raw === undefined;
+  const percent = same ? null : Number(raw);
+  if (!same && (!Number.isFinite(percent) || percent < 0 || percent > 50)) return res.status(400).json({ message: "Select the price adjustment from the list" });
+  try {
+    const g = await guard(req, res); if (!g) return;
+    const opts = await markupOptions(pool);
+    const cur = (await pool.query("SELECT markup_percent::float AS p FROM job_repair_item WHERE id = $1 AND job_id = $2", [itemId, g.jobId])).rows[0];
+    if (!cur) return res.status(404).json({ message: "Repair item not found" });
+    if (!same && !opts.includes(percent) && percent !== cur.p) return res.status(400).json({ message: `Select one of: ${opts.map((x) => (x === 0 ? "None" : `${x}%`)).join(", ")}` });
+    await pool.query("UPDATE job_repair_item SET markup_percent = $3, changed_by = $4, changed_at = CURRENT_TIMESTAMP WHERE id = $1 AND job_id = $2 AND status = 'ACTIVE'", [itemId, g.jobId, percent, currentUserId(req)]);
+    return res.json(await repairList(g.jobId));
+  } catch (e) { console.error("set line markup:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
 
 // PUT /jobs/:id/inspection/markup   { percent }   -> price adjustment for the whole job (0, 2, 5, 8, 10 or 12 %)

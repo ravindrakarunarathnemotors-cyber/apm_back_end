@@ -133,15 +133,17 @@ async function loadJob(db, jobId) {
 const uid = (v, p) => { const s = String(v ?? "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40); return s || `${p}${Math.random().toString(36).slice(2, 9)}`; };
 const arr = (v, max = 200) => (Array.isArray(v) ? v.slice(0, max) : []);
 const txt = (v, n) => String(v ?? "").trim().slice(0, n);
+// price adjustment (%) of ONE line: null = the line follows the adjustment of this scope
+const linePct = (v) => (v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 50 ? Number(v) : null);
 function sanitize(b) {
-  const labour = arr(b.labour).map((x) => ({ id: uid(x?.id, "l"), childId: Number.isInteger(Number(x?.childId)) && x?.childId !== null && x?.childId !== "" ? Number(x.childId) : null, label: txt(x?.label, 300), description: txt(x?.description, 300), qty: Math.min(Math.max(parseInt(x?.qty, 10) || 1, 1), 9999), amount: money(x?.amount) })).filter((x) => x.description);
+  const labour = arr(b.labour).map((x) => ({ id: uid(x?.id, "l"), childId: Number.isInteger(Number(x?.childId)) && x?.childId !== null && x?.childId !== "" ? Number(x.childId) : null, label: txt(x?.label, 300), description: txt(x?.description, 300), qty: Math.min(Math.max(parseInt(x?.qty, 10) || 1, 1), 9999), amount: money(x?.amount) , markupPercent: linePct(x?.markupPercent) })).filter((x) => x.description);
   const repairParents = arr(b.repairParents, 100).map((x) => ({ parent: txt(x?.parent, 200), department: txt(x?.department, 100) })).filter((x) => x.parent);
   const parts = arr(b.parts).map((x) => ({
     id: uid(x?.id, "p"), partId: Number.isInteger(Number(x?.partId)) ? Number(x.partId) : null, name: txt(x?.name, 200), brand: txt(x?.brand, 60), quality: txt(x?.quality, 60),
     qty: Math.min(Math.max(parseInt(x?.qty, 10) || 1, 1), 9999), unitPrice: money(x?.unitPrice), source: x?.source === "CATALOG" ? "CATALOG" : "MANUAL",
-    stock: ["IN_STOCK", "OUT_OF_STOCK"].includes(x?.stock) ? x.stock : "UNKNOWN",
+    stock: ["IN_STOCK", "OUT_OF_STOCK"].includes(x?.stock) ? x.stock : "UNKNOWN", markupPercent: linePct(x?.markupPercent),
   })).filter((x) => x.name);
-  const quotes = arr(b.quotes).map((x) => ({ id: uid(x?.id, "q"), description: txt(x?.description, 300), photoUrl: txt(x?.photoUrl, 500), qty: Math.min(Math.max(parseInt(x?.qty, 10) || 1, 1), 9999), price: money(x?.price) })).filter((x) => x.description);
+  const quotes = arr(b.quotes).map((x) => ({ id: uid(x?.id, "q"), description: txt(x?.description, 300), photoUrl: txt(x?.photoUrl, 500), qty: Math.min(Math.max(parseInt(x?.qty, 10) || 1, 1), 9999), price: money(x?.price), markupPercent: linePct(x?.markupPercent) })).filter((x) => x.description);
   const files = arr(b.files, 50).map((x) => ({ id: uid(x?.id, "f"), name: txt(x?.name, 200), url: txt(x?.url, 600), mime: txt(x?.mime, 100) })).filter((x) => x.url);
   const ids = new Set([...labour, ...parts, ...quotes].map((x) => x.id));
   const inList = (v) => arr(v, 500).map((x) => String(x)).filter((x) => ids.has(x));
@@ -155,6 +157,7 @@ function sanitize(b) {
     agreedScope: inList(b.agreedScope),
     partsBy: ["US", "CLIENT"].includes(b.partsBy) ? b.partsBy : null,
     clientParts: inList(b.clientParts),
+    unusedParts: inList(b.unusedParts).filter((x) => !inList(b.clientParts).includes(x)),   // items marked "Not used" (not charged, not supplied)
     sentVia: b.sentVia === "SMS" ? "SMS" : null,
     // price adjustment (%) of this Extra Job Scope. null = follows the one chosen in the Vehicle Job Inspection (job.price_markup_percent); a number = chosen here
     markupPercent: b.markupPercent !== null && b.markupPercent !== undefined && b.markupPercent !== "" && Number.isFinite(Number(b.markupPercent)) && Number(b.markupPercent) >= 0 && Number(b.markupPercent) <= 50 ? Number(b.markupPercent) : null,
@@ -178,16 +181,16 @@ function totals(d, jobPct = 0, inc = {}, jobSparePct = null) {
   // "Agreed scope only" applies to the repair (labour) lines; the spare parts are always part of the estimate (unless the customer brings them)
   const agreed = (x) => d.decision !== "REJECTED" && (d.decision !== "PARTIAL" || d.agreedScope.includes(x.id));
   const agreedPart = () => d.decision !== "REJECTED";
-  const adj = (u) => Math.round(u * (100 + (d.markupPercent ?? jobPct))) / 100;                                   // repair lines
+  const adj = (u, own) => Math.round(u * (100 + (own ?? d.markupPercent ?? jobPct))) / 100;                          // repair lines (own = the line's individual %)
   // spare parts + third-party items: own % of this scope, else the repair % chosen in this scope, else the job's spare %
   const sparePct = d.sparePercent ?? (d.markupPercent != null ? d.markupPercent : (jobSparePct ?? jobPct));
-  const adjS = (u) => Math.round(u * (100 + sparePct)) / 100;
-  const labour = inc.labour === false ? 0 : d.labour.filter(agreed).reduce((s, x) => s + x.qty * adj(x.amount), 0);
-  const parts = inc.parts === false ? 0 : d.parts.filter((x) => agreedPart() && !(d.partsBy === "CLIENT" && d.clientParts.includes(x.id))).reduce((s, x) => s + x.qty * adjS(x.unitPrice), 0);
+  const adjS = (u, own) => Math.round(u * (100 + (own ?? sparePct))) / 100;
+  const labour = inc.labour === false ? 0 : d.labour.filter(agreed).reduce((s, x) => s + x.qty * adj(x.amount, x.markupPercent), 0);
+  const parts = inc.parts === false ? 0 : d.parts.filter((x) => agreedPart() && !(d.partsBy === "CLIENT" && (d.clientParts.includes(x.id) || (d.unusedParts || []).includes(x.id)))).reduce((s, x) => s + x.qty * adjS(x.unitPrice, x.markupPercent), 0);
   // third-party items: their own switch (inc.quotes, default = follows inc.parts); the ones the customer brings are not charged
-  const quotes = (inc.quotes ?? inc.parts) === false ? 0 : d.quotes.filter((x) => agreedPart() && !(d.partsBy === "CLIENT" && d.clientParts.includes(x.id))).reduce((s, x) => s + x.qty * adjS(x.price), 0);
+  const quotes = (inc.quotes ?? inc.parts) === false ? 0 : d.quotes.filter((x) => agreedPart() && !(d.partsBy === "CLIENT" && (d.clientParts.includes(x.id) || (d.unusedParts || []).includes(x.id)))).reduce((s, x) => s + x.qty * adjS(x.price, x.markupPercent), 0);
   const r2 = (n) => Math.round(n * 100) / 100;
-  const all = { labour: r2(d.labour.reduce((s, x) => s + x.qty * adj(x.amount), 0)), parts: r2(d.parts.reduce((s, x) => s + x.qty * adjS(x.unitPrice), 0) + d.quotes.reduce((s, x) => s + x.qty * adjS(x.price), 0)) };
+  const all = { labour: r2(d.labour.reduce((s, x) => s + x.qty * adj(x.amount, x.markupPercent), 0)), parts: r2(d.parts.reduce((s, x) => s + x.qty * adjS(x.unitPrice, x.markupPercent), 0) + d.quotes.reduce((s, x) => s + x.qty * adjS(x.price, x.markupPercent), 0)) };
   return { labour: r2(labour), spare: r2(parts + quotes), total: r2(labour + parts + quotes), all };
 }
 const SELECT = `SELECT id, job_id AS "jobId", seq, status, data, estimated_total::float AS "estimatedTotal", sms_sent_at AS "smsSentAt", created_at AS "createdAt", completed_at AS "completedAt", inventory_sent_at AS "inventorySentAt", inventory_sig AS "inventorySig" FROM job_extra_scope`;
@@ -446,7 +449,7 @@ router.post("/jobs/:id/scopes/:sid/complete", authenticateToken, async (req, res
     }
     // what the customer rejected / brings himself is taken off the Inventory list again (only the lines nobody has reserved or issued yet)
     try {
-      const drop = d.decision === "REJECTED" ? new Set([...d.parts, ...d.quotes].map((x) => x.id)) : new Set(d.partsBy === "CLIENT" ? d.clientParts : []);
+      const drop = d.decision === "REJECTED" ? new Set([...d.parts, ...d.quotes].map((x) => x.id)) : new Set(d.partsBy === "CLIENT" ? [...d.clientParts, ...(d.unusedParts || [])] : []);
       if (drop.size) {
         await pool.query("DELETE FROM job_spare_part WHERE job_id = $1 AND extra_scope_id = $2 AND extra_item_id = ANY($3::text[]) AND (reserved_qty + issued_qty - returned_qty) <= 0", [g.jobId, g.sid, [...drop]]);
         await pool.query("DELETE FROM job_spare_quote WHERE job_id = $1 AND extra_scope_id = $2 AND extra_item_id = ANY($3::text[]) AND status <> 'QUOTED'", [g.jobId, g.sid, [...drop]]);

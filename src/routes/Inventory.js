@@ -535,12 +535,19 @@ router.get("/inventory/dashboard", authenticateToken, async (req, res) => {
       SELECT COUNT(*) FILTER (WHERE completed_at IS NULL AND NOT no_parts_needed)::int AS "openOrders",
              COUNT(*) FILTER (WHERE completed_at IS NULL AND link_sent_at IS NOT NULL AND logistics_updated_at IS NULL)::int AS "waitingLogistics"
       FROM job_spare_parts`);
-    const quotes = await pool.query("SELECT COUNT(*) FILTER (WHERE status <> 'QUOTED')::int AS \"pendingQuotes\" FROM job_spare_quote");
+    const quotes = await pool.query(`SELECT COUNT(*) FILTER (WHERE status <> 'QUOTED')::int AS "pendingQuotes" FROM job_spare_quote q WHERE NOT ${customerProvides('q.job_id', '-q.id')}`);
     const adj = await pool.query("SELECT COUNT(*)::int AS \"pendingAdjustments\" FROM stock_adjustment WHERE status = 'PENDING'");
     const exp = await pool.query("SELECT COUNT(DISTINCT part_id)::int AS \"expiringBatches\" FROM stock_batch WHERE qty_on_hand > 0 AND expiry_date IS NOT NULL AND expiry_date <= CURRENT_DATE + 30");
     return res.json({ ...kpi.rows[0], ...orders.rows[0], ...quotes.rows[0], ...adj.rows[0], ...exp.rows[0], lowItems: low.rows, categories: cats.rows, recent: moves.rows });
   } catch (e) { console.error("inventory dashboard:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
+
+// Customer Approval > "Spare Parts Provided by": a spare part / third-party item the CUSTOMER brings (or that is marked "Not used") is not ours to supply, so it is left out of the Inventory lists.
+// (client_parts holds the spare part ids; a third-party quotation item is stored as the negative number of its id)
+const customerProvides = (jobExpr, idExpr) => `EXISTS (SELECT 1 FROM job_customer_approval cp_ WHERE cp_.job_id = ${jobExpr} AND cp_.parts_by = 'CLIENT' AND (COALESCE(cp_.client_parts, '[]'::jsonb) @> to_jsonb((${idExpr})::int) OR COALESCE(cp_.unused_parts, '[]'::jsonb) @> to_jsonb((${idExpr})::int)))`;
+
+// An Extra Job Scope the customer has not confirmed yet has status 'OPEN': its spare parts are shown, but cannot be reserved / issued until the customer approves it.
+const extraPending = (alias) => `COALESCE((SELECT e.status FROM job_extra_scope e WHERE e.id = ${alias}.extra_scope_id), '') = 'OPEN'`;
 
 // GET /inventory/spare-orders?status=open|waiting|done|all   -> spare part requirement lists of all jobs
 router.get("/inventory/spare-orders", authenticateToken, async (req, res) => {
@@ -551,22 +558,22 @@ router.get("/inventory/spare-orders", authenticateToken, async (req, res) => {
               sp.no_parts_needed AS "noParts", sp.link_sent_at AS "linkSentAt", sp.logistics_updated_at AS "logisticsUpdatedAt", sp.completed_at AS "completedAt",
               COALESCE(it.lines, '[]'::json) AS lines,
               COALESCE(it.total, 0)::float AS total, COALESCE(it.issued_value, 0)::float AS "issuedValue",
-              (SELECT COUNT(*) FROM job_spare_quote q WHERE q.job_id = j.id AND q.status <> 'QUOTED')::int AS "pendingQuotes",
+              (SELECT COUNT(*) FROM job_spare_quote q WHERE q.job_id = j.id AND q.status <> 'QUOTED' AND NOT ${customerProvides('q.job_id', '-q.id')})::int AS "pendingQuotes",
               (SELECT CASE WHEN a.decision IS NOT NULL OR a.completed_at IS NOT NULL THEN 'APPROVED' ELSE 'PENDING' END
                  FROM job_customer_approval a WHERE a.job_id = j.id) AS "approval"
        FROM job_spare_parts sp
        JOIN job j ON j.id = sp.job_id JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id
        LEFT JOIN LATERAL (
-         SELECT json_agg(json_build_object('id', id, 'partId', part_id, 'name', name, 'brand', brand, 'quality', quality, 'qty', qty, 'unitPrice', unit_price::float,
-                                          'stockStatus', stock_status, 'extraSeq', (SELECT e.seq FROM job_extra_scope e WHERE e.id = job_spare_part.extra_scope_id), 'reserved', reserved_qty::float, 'issued', issued_qty::float, 'returned', returned_qty::float,
+         SELECT json_agg(json_build_object('id', id, 'partId', part_id, 'manual', (part_id IS NULL), 'name', name, 'brand', brand, 'quality', quality, 'qty', qty, 'unitPrice', unit_price::float,
+                                          'stockStatus', stock_status, 'extraSeq', (SELECT e.seq FROM job_extra_scope e WHERE e.id = job_spare_part.extra_scope_id), 'extraStatus', (SELECT e.status FROM job_extra_scope e WHERE e.id = job_spare_part.extra_scope_id), 'reserved', reserved_qty::float, 'issued', issued_qty::float, 'returned', returned_qty::float,
                                           'available', COALESCE((SELECT SUM(b.qty_on_hand - b.qty_reserved) FROM stock_balance b WHERE b.part_id = job_spare_part.part_id), 0)::float) ORDER BY id) AS lines,
                 SUM(qty * unit_price) AS total,
                 SUM((issued_qty - returned_qty) * unit_price) AS issued_value
-         FROM job_spare_part WHERE job_id = j.id) it ON true
+         FROM job_spare_part WHERE job_id = j.id AND NOT ${customerProvides('job_spare_part.job_id', 'job_spare_part.id')}) it ON true
        WHERE ($1 = 'all')
-          OR ($1 = 'open' AND (NOT EXISTS (SELECT 1 FROM job_customer_approval a WHERE a.job_id = j.id AND (a.decision IS NOT NULL OR a.completed_at IS NOT NULL)) OR EXISTS (SELECT 1 FROM job_spare_part x WHERE x.job_id = j.id AND x.qty - (x.issued_qty - x.returned_qty) > 0) OR EXISTS (SELECT 1 FROM job_spare_quote z WHERE z.job_id = j.id AND z.status <> 'QUOTED')))
+          OR ($1 = 'open' AND (NOT EXISTS (SELECT 1 FROM job_customer_approval a WHERE a.job_id = j.id AND (a.decision IS NOT NULL OR a.completed_at IS NOT NULL)) OR EXISTS (SELECT 1 FROM job_spare_part x WHERE x.job_id = j.id AND x.qty - (x.issued_qty - x.returned_qty) > 0 AND NOT ${customerProvides('x.job_id', 'x.id')} AND NOT ${extraPending('x')}) OR EXISTS (SELECT 1 FROM job_spare_quote z WHERE z.job_id = j.id AND z.status <> 'QUOTED' AND NOT ${customerProvides('z.job_id', '-z.id')})))
           OR ($1 = 'waiting' AND EXISTS (SELECT 1 FROM job_customer_approval a WHERE a.job_id = j.id AND (a.decision IS NOT NULL OR a.completed_at IS NOT NULL)) AND sp.link_sent_at IS NOT NULL AND sp.logistics_updated_at IS NULL)
-          OR ($1 = 'done' AND EXISTS (SELECT 1 FROM job_customer_approval a WHERE a.job_id = j.id AND (a.decision IS NOT NULL OR a.completed_at IS NOT NULL)) AND NOT EXISTS (SELECT 1 FROM job_spare_part x WHERE x.job_id = j.id AND x.qty - (x.issued_qty - x.returned_qty) > 0) AND NOT EXISTS (SELECT 1 FROM job_spare_quote z WHERE z.job_id = j.id AND z.status <> 'QUOTED') AND EXISTS (SELECT 1 FROM job_spare_part y WHERE y.job_id = j.id))
+          OR ($1 = 'done' AND EXISTS (SELECT 1 FROM job_customer_approval a WHERE a.job_id = j.id AND (a.decision IS NOT NULL OR a.completed_at IS NOT NULL)) AND NOT EXISTS (SELECT 1 FROM job_spare_part x WHERE x.job_id = j.id AND x.qty - (x.issued_qty - x.returned_qty) > 0 AND NOT ${customerProvides('x.job_id', 'x.id')} AND NOT ${extraPending('x')}) AND NOT EXISTS (SELECT 1 FROM job_spare_quote z WHERE z.job_id = j.id AND z.status <> 'QUOTED' AND NOT ${customerProvides('z.job_id', '-z.id')}) AND EXISTS (SELECT 1 FROM job_spare_part y WHERE y.job_id = j.id AND NOT ${customerProvides('y.job_id', 'y.id')}))
        ORDER BY sp.updated_at DESC LIMIT 200`, [status]);
     return res.json(r.rows);
   } catch (e) { console.error("spare orders:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
@@ -578,9 +585,9 @@ router.get("/inventory/quotes", authenticateToken, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT q.id, q.job_id AS "jobId", j.job_no AS "jobNo", j.reg_no AS "regNo", q.photo_url AS "photoUrl", q.description, q.status,
-              q.quoted_price::float AS "quotedPrice", q.quoted_note AS "quotedNote", q.quoted_at AS "quotedAt", q.created_at AS "createdAt", (SELECT e.seq FROM job_extra_scope e WHERE e.id = q.extra_scope_id) AS "extraSeq"
+              q.quoted_price::float AS "quotedPrice", q.quoted_note AS "quotedNote", q.quoted_at AS "quotedAt", q.created_at AS "createdAt", (SELECT e.seq FROM job_extra_scope e WHERE e.id = q.extra_scope_id) AS "extraSeq", (SELECT e.status FROM job_extra_scope e WHERE e.id = q.extra_scope_id) AS "extraStatus"
        FROM job_spare_quote q JOIN job j ON j.id = q.job_id
-       WHERE ($1::boolean = false OR q.status <> 'QUOTED') ORDER BY q.id DESC LIMIT 200`, [pending]);
+       WHERE ($1::boolean = false OR q.status <> 'QUOTED') AND NOT ${customerProvides('q.job_id', '-q.id')} ORDER BY q.id DESC LIMIT 200`, [pending]);
     return res.json(r.rows);
   } catch (e) { console.error("quotes list:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
 });
@@ -631,10 +638,11 @@ router.post("/inventory/jobs/:jobId/parts/:lineId/:action", authenticateToken, a
     await client.query("BEGIN");
     const l = await client.query(
       `SELECT l.id, l.part_id AS "partId", l.qty::float AS qty, l.reserved_qty::float AS reserved, l.issued_qty::float AS issued, l.returned_qty::float AS returned,
-              l.reserve_location_id AS "reserveLoc", l.issue_location_id AS "issueLoc", j.job_no AS "jobNo"
+              l.reserve_location_id AS "reserveLoc", l.issue_location_id AS "issueLoc", j.job_no AS "jobNo", (SELECT e.status FROM job_extra_scope e WHERE e.id = l.extra_scope_id) AS "extraStatus"
        FROM job_spare_part l JOIN job j ON j.id = l.job_id WHERE l.id = $1 AND l.job_id = $2 FOR UPDATE OF l`, [lineId, jobId]);
     if (l.rowCount === 0) throw fail(404, "Spare part line not found");
     const line = l.rows[0];
+    if ((action === "reserve" || action === "issue") && line.extraStatus === "OPEN") throw fail(409, "This part belongs to an Extra Job Scope the customer has not approved yet. Reserve / issue it after the approval.");
     if (!line.partId) throw fail(400, "This line is not linked to an inventory item (manual price). Stock cannot be moved.");
     const netIssued = line.issued - line.returned;
     const needed = Math.max(0, line.qty - netIssued - line.reserved);   // still to reserve / issue

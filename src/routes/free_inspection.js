@@ -39,7 +39,7 @@ async function loadJob(db, jobId) {
      FROM job j JOIN customer c ON c.id = j.customer_id LEFT JOIN department d ON d.id = j.department_id WHERE j.id = $1`, [jobId]);
   return r.rows[0] || null;
 }
-const reached = (job) => job.status === "IN_PROGRESS" && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
+const reached = (job) => ["IN_PROGRESS", "COMPLETED"].includes(job.status) && job.hasStage && job.thisStageNo && job.stageNo >= job.thisStageNo;
 
 async function state(db) {
   return (await db.query("SELECT id, name FROM department WHERE is_active AND show_in_job_stage ORDER BY sort_order, id")).rows;
@@ -52,30 +52,6 @@ async function header(db, jobId) {
      FROM job_free_inspection f LEFT JOIN department d ON d.id = f.sched_department_id WHERE f.job_id = $1`, [jobId]);
   return h.rows[0] || { explained: null, willing: null, schedDate: null, schedTime: null, schedDepartmentId: null, schedDepartmentName: null, signedByName: null, signatureImage: null, completedAt: null };
 }
-
-// GET /free-inspections   -> the free inspections that customers agreed to (willing = YES) and that are scheduled from today on.
-//   Shown on the Job Dashboard. ?days=60 (how far ahead, default 60, max 365)
-router.get("/free-inspections", authenticateToken, async (req, res) => {
-  const days = Math.min(365, Math.max(1, Number(req.query.days) || 60));
-  try {
-    const r = await pool.query(
-      `SELECT f.job_id AS "jobId", j.job_no AS "jobNo", j.reg_no AS "regNo",
-              c.customer_name AS "customerName", c.contact_number AS "contactNumber",
-              bd.name AS "fromDepartment", sd.name AS "scheduleDepartment",
-              to_char(f.sched_date, 'YYYY-MM-DD') AS "schedDate", to_char(f.sched_time, 'HH24:MI') AS "schedTime",
-              f.signed_by_name AS "signedByName", f.completed_at AS "bookedAt"
-         FROM job_free_inspection f
-         JOIN job j ON j.id = f.job_id
-         JOIN customer c ON c.id = j.customer_id
-         LEFT JOIN department bd ON bd.id = j.department_id
-         LEFT JOIN department sd ON sd.id = f.sched_department_id
-        WHERE f.willing = 'YES' AND f.completed_at IS NOT NULL AND f.sched_date IS NOT NULL
-          AND f.sched_date >= CURRENT_DATE AND f.sched_date <= CURRENT_DATE + $1::int
-        ORDER BY f.sched_date, f.sched_time, f.job_id
-        LIMIT 200`, [days]);
-    return res.json(r.rows);
-  } catch (e) { console.error("list free inspections:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
-});
 
 // GET /jobs/:id/free-inspection
 router.get("/jobs/:id/free-inspection", authenticateToken, async (req, res) => {

@@ -90,8 +90,9 @@ async function loadJob(db, jobId) {
 const reached = (job) => job.status === "IN_PROGRESS" && job.hasSpareParts
   && (job.stageNo >= job.spareStageNo || (job.hasJobInspection && job.stageNo === job.inspectionStageNo && job.inspectionStageNo + 1 === job.spareStageNo));
 
+pool.query("ALTER TABLE job_spare_part ADD COLUMN IF NOT EXISTS markup_percent numeric(6,2)").catch(() => {});   // price adjustment of THIS part (NULL = the job's spare parts adjustment)
 const ITEM_SELECT = `SELECT id, part_id AS "partId", name, brand, quality, qty, unit_price::float AS "unitPrice", price_source AS "priceSource",
-                            stock_status AS "stockStatus", note, COALESCE(warranty_claim, false) AS "warrantyClaim" FROM job_spare_part`;
+                            stock_status AS "stockStatus", note, COALESCE(warranty_claim, false) AS "warrantyClaim", markup_percent::float AS "markupPercent" FROM job_spare_part`;
 const QUOTE_SELECT = `SELECT id, photo_url AS "photoUrl", description, status, quoted_price::float AS "quotedPrice", quoted_note AS "quotedNote", quoted_at AS "quotedAt" FROM job_spare_quote`;
 
 async function options(db) {
@@ -110,7 +111,7 @@ async function listState(db, jobId) {
   // "Upload to ERP System" is needed only when there is something to send: never uploaded, new quotation requests, or anything changed after the last upload
   const hasContent = items.rows.length > 0 || quotes.rows.length > 0;
   header.needsUpload = hasContent && (!header.linkSentAt || quotes.rows.some((q) => q.status === "REQUESTED") || (header.updatedAt && new Date(header.updatedAt) > new Date(header.linkSentAt)));
-  return { items: items.rows, quotes: quotes.rows, header, totalSparePartsValue: Math.round(total * 100) / 100 };
+  return { items: items.rows, quotes: quotes.rows, header, markupOptions: await markupOptions(db), totalSparePartsValue: Math.round(total * 100) / 100 };
 }
 
 // "Root cause / Labour work list" shown from the previous related stage (Job Inspection for Mechanical, else the complaint)
@@ -187,6 +188,33 @@ router.post("/jobs/:id/spare-parts/items", authenticateToken, async (req, res) =
 });
 
 // PUT /jobs/:id/spare-parts/items/:itemId   { qty?, unitPrice?, brand?, name? }   -> "Update spare parts price manually"
+// PUT /jobs/:id/spare-parts/items/:itemId/markup   { percent }   -> price adjustment of ONE spare part (null = follow the job's spare parts adjustment)
+async function markupOptions(db) {
+  try {
+    const r = await db.query("SELECT value FROM app_setting WHERE group_key = 'pricing' AND key = 'adjustmentOptions'");
+    const v = r.rows[0]?.value;
+    if (Array.isArray(v)) { const l = v.map(Number).filter((x) => Number.isFinite(x) && x >= 0 && x <= 50); return [...new Set([0, ...l])].sort((a, b) => a - b); }
+  } catch (_) { /* no settings table yet */ }
+  return [0, 2, 5, 8, 10, 12];
+}
+router.put("/jobs/:id/spare-parts/items/:itemId/markup", authenticateToken, async (req, res) => {
+  const itemId = toInt(req.params.itemId);
+  if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
+  const raw = req.body?.percent;
+  const same = raw === null || raw === "same" || raw === undefined;
+  const percent = same ? null : Number(raw);
+  if (!same && (!Number.isFinite(percent) || percent < 0 || percent > 50)) return res.status(400).json({ message: "Select the price adjustment from the list" });
+  try {
+    const g = await guard(req, res); if (!g) return;
+    const opts = await markupOptions(pool);
+    const cur = (await pool.query("SELECT markup_percent::float AS p FROM job_spare_part WHERE id = $1 AND job_id = $2", [itemId, g.jobId])).rows[0];
+    if (!cur) return res.status(404).json({ message: "Spare part not found" });
+    if (!same && !opts.includes(percent) && percent !== cur.p) return res.status(400).json({ message: `Select one of: ${opts.map((x) => (x === 0 ? "None" : `${x}%`)).join(", ")}` });
+    await pool.query("UPDATE job_spare_part SET markup_percent = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND job_id = $2", [itemId, g.jobId, percent]);
+    return reply(res, g.jobId);
+  } catch (e) { console.error("set part markup:", e.code, e.message); return res.status(500).json({ message: "Server error" }); }
+});
+
 router.put("/jobs/:id/spare-parts/items/:itemId", authenticateToken, async (req, res) => {
   const itemId = toInt(req.params.itemId);
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "Invalid item" });
@@ -429,4 +457,5 @@ router.put("/public/spare-parts/:token", async (req, res) => {
   } finally { client.release(); }
 });
 
+router.notifyInventory = notifyInventory;   // used by the Job Inspection route to notify Inventory when the parts are sent automatically while signing
 module.exports = router;
